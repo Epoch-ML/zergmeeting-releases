@@ -230,6 +230,10 @@ test("enforces every changed-path boundary without rejecting ordinary product pa
   assert.deepEqual(codes(maximumPathLength), []);
 
   for (const changedPaths of [
+    undefined,
+    null,
+    "docs/file.md",
+    {},
     ["d".repeat(513)],
     [42],
     [""],
@@ -302,7 +306,12 @@ test("protects immutable policy roots and requires review only for routine input
   for (const invalid of [undefined, null, "true", 1, {}]) {
     const input = safeInput();
     input.routineProtectedChangeApproved = invalid;
-    assert.deepEqual(codes(input), ["approval-boundary"]);
+    assert.deepEqual(auditAnchoredPullRequestData(input), [
+      {
+        code: "approval-boundary",
+        message: "routine protected-input review must be an explicit boolean",
+      },
+    ]);
   }
   assert.deepEqual(codes(safeInput()), []);
 });
@@ -422,6 +431,34 @@ test("CLI reads bounded files, preserves NUL path records, and exposes exit stat
     },
   ]);
   assert.equal(protectedChange.stderr, "");
+
+  await writeFile(diffPath, "package-lock.json\0");
+  const unreviewedRoutine = await runEvaluator(argumentsFor());
+  assert.equal(unreviewedRoutine.status, 1);
+  assert.deepEqual(JSON.parse(unreviewedRoutine.stdout).diagnostics, [
+    {
+      code: "protected-input-review",
+      message: "routine protected inputs require a head-bound independent review",
+    },
+  ]);
+  const reviewedArguments = argumentsFor();
+  reviewedArguments[6] = "true";
+  assert.deepEqual(await runEvaluator(reviewedArguments), {
+    status: 0,
+    stdout: `${JSON.stringify({ diagnostics: [] }, null, 2)}\n`,
+    stderr: "",
+  });
+
+  for (const malformedApproval of ["TRUE", "", "1"]) {
+    const malformedArguments = argumentsFor();
+    malformedArguments[6] = malformedApproval;
+    assert.deepEqual(await runEvaluator(malformedArguments), {
+      status: 1,
+      stdout: "",
+      stderr:
+        "anchored-policy: routine protected-input review must be true or false\n",
+    });
+  }
 
   await writeFile(diffPath, "docs/not-terminated.md");
   const unterminated = await runEvaluator(argumentsFor());
