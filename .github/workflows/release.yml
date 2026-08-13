@@ -321,6 +321,7 @@ jobs:
           set -euo pipefail
           npm ci --prefix source/zapps/zergmeeting
           npm ci --prefix source/ztc
+          npm ci --ignore-scripts --no-audit --no-fund --prefix source/zapps/zergmeeting/scripts/release
           npm ci --ignore-scripts --prefix release-repository
           (
             cd release-repository
@@ -332,7 +333,8 @@ jobs:
       - name: Test and audit the exact source
         run: |
           set -euo pipefail
-          npm audit --omit=dev --audit-level=moderate --prefix source/zapps/zergmeeting
+          npm run audit:web-production --prefix source/zapps/zergmeeting
+          npm --prefix source/ztc audit --omit=dev --audit-level=moderate
           cargo audit --file source/zapps/zergmeeting/src-tauri/Cargo.lock
           npm run test:release --prefix source/zapps/zergmeeting
           npm run test:meeting-runtime --prefix source/zapps/zergmeeting
