@@ -48,6 +48,10 @@ describe("ZergMeeting source-build release contract", () => {
       install.run,
       /^\s*npm ci --prefix source\/zapps\/zergmeeting\s*$/m,
     );
+    assert.match(
+      install.run,
+      /^\s*npm ci --prefix source\/ztc\s*$/m,
+    );
     assert.doesNotMatch(
       install.run,
       /npm ci[^\n]*--omit(?:=|\s+)optional/,
@@ -94,8 +98,7 @@ describe("ZergMeeting source-build release contract", () => {
       "the verified native frontend must pass its source gate before Tauri builds it",
     );
     assert.deepEqual(appBuild.env, {
-      ZERGMEETING_NODE_ARCHIVE: "${{ runner.temp }}/node-v22.23.2-darwin-arm64.tar.gz",
-      ZERGMEETING_NODE_SHA256: "61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6",
+      ZERGMEETING_UPDATE_CHANNEL: "${{ needs.validate.outputs.channel }}",
     });
   });
 
@@ -133,10 +136,10 @@ describe("ZergMeeting source-build release contract", () => {
     }
     for (const token of [
       "source/zapps/zergmeeting/src-tauri/tauri.conf.json",
-      "config.build.beforeBuildCommand",
-      "npm run release:stage",
-      "config.bundle.macOS.entitlements",
-      "Entitlements.plist",
+      "config.productName",
+      "Zerg Meeting",
+      "config.identifier",
+      "com.zergai.meeting",
       "config.bundle.macOS.infoPlist",
       "Info.plist",
       "cmp --silent",
@@ -145,6 +148,7 @@ describe("ZergMeeting source-build release contract", () => {
     ]) {
       assert.ok(binding.run.includes(token), `media binding must enforce ${token}`);
     }
+    assert.doesNotMatch(binding.run, /beforeBuildCommand|release:stage/);
   });
 
   it("generates the fail-closed production config without a mutable updater flag", () => {
@@ -183,9 +187,12 @@ describe("ZergMeeting source-build release contract", () => {
     const resources = requireStep(build, "Verify the exact bundled ZergMeeting release assets");
     assert.match(resources.run, /Contents\/Resources\/desktop-runtime/);
     assert.match(resources.run, /meeting-bridge\.mjs/);
-    assert.match(resources.run, /node_modules\/zerg-ztc/);
-    assert.match(resources.run, /node-aarch64-apple-darwin/);
-    assert.match(resources.run, /ztc-capture-aarch64-apple-darwin/);
+    assert.match(resources.run, /node_modules\/zerg-ztc\/dist\/cli_main\.js/);
+    assert.match(resources.run, /Contents\/MacOS\/node"/);
+    assert.match(resources.run, /Contents\/MacOS\/ztc-capture"/);
+    assert.doesNotMatch(resources.run, /Contents\/MacOS\/node-aarch64-apple-darwin/);
+    assert.doesNotMatch(resources.run, /Contents\/MacOS\/ztc-capture-aarch64-apple-darwin/);
+    assert.match(resources.run, /test ! -e "\$resources\/node_modules\/\.bin"/);
     assert.match(resources.run, /v22\.23\.2/);
     assert.match(resources.run, /find "\$resources" -type l/);
 

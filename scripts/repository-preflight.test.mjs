@@ -130,6 +130,8 @@ const releaseStatusRule =
   "required_status_checks:strict:on-create:Protected-base release policy:15368";
 const sourceZergLangStatusRule =
   "required_status_checks:strict:on-create:Protected-base ZergLang release policy:15368";
+const sourceDJZergStatusRule =
+  "required_status_checks:strict:on-create:Protected-base DJZerg release policy:15368";
 const sourceZergMeetingStatusRule =
   "required_status_checks:strict:on-create:Protected-base ZergMeeting release policy:15368";
 
@@ -170,7 +172,8 @@ const sourceRulesets = [
     include: ["refs/heads/development"], exclude: [],
     bypass: [reviewerBypass], rules: [
       reviewedPullRequestRule, "required_linear_history",
-      sourceZergLangStatusRule, sourceZergMeetingStatusRule,
+      sourceZergLangStatusRule, sourceDJZergStatusRule,
+      sourceZergMeetingStatusRule,
     ] },
   { name: "Desktop release tag authority", target: "tag",
     include: desktopTags, exclude: [],

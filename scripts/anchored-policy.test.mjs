@@ -32,7 +32,15 @@ function safeInput() {
     candidateMode: "100644",
     candidateSize: Buffer.byteLength(releaseWorkflow),
     candidateWorkflow: releaseWorkflow,
+    routineProtectedChangeApproved: false,
   };
+}
+
+function exactDiffBoundaryPaths() {
+  return Array.from({ length: 512 }, (_, index) => {
+    const prefix = `docs/${index}-`;
+    return `${prefix}${"x".repeat(511 - Buffer.byteLength(prefix))}`;
+  });
 }
 
 function codes(input) {
@@ -60,7 +68,10 @@ test("uses a base-anchored pull_request_target workflow without head execution",
   const workflow = parse(await readFile(anchorUrl, "utf8"));
 
   assert.deepEqual(workflow.on, {
-    pull_request_target: { branches: ["main"], types: ["opened", "reopened", "synchronize"] },
+    pull_request_target: {
+      branches: ["main"],
+      types: ["opened", "reopened", "synchronize", "labeled", "unlabeled"],
+    },
   });
   assert.deepEqual(workflow.permissions, { contents: "read" });
   assert.deepEqual(Object.keys(workflow.jobs), ["anchored-policy"]);
@@ -140,7 +151,7 @@ test("audits immutable head workflow bytes and rejects protected policy changes"
 
   for (const mutate of [
     (input) => { input.headSha = "moving-head"; },
-    (input) => { input.changedPaths = Array.from({ length: 257 }, (_, i) => `docs/${i}`); },
+    (input) => { input.changedPaths = ["docs/../policy"]; },
     (input) => { input.candidateMode = "100755"; },
     (input) => { input.candidateSize = 262_145; },
   ]) {
@@ -195,19 +206,30 @@ test("fails closed on non-object input and non-canonical immutable SHAs", () => 
 });
 
 test("enforces every changed-path boundary without rejecting ordinary product paths", () => {
-  const maximumPaths = safeInput();
-  maximumPaths.changedPaths = Array.from(
-    { length: 256 },
+  const realLargeChange = safeInput();
+  realLargeChange.changedPaths = Array.from(
+    { length: 468 },
     (_, index) => `docs/${index}`,
   );
-  assert.deepEqual(codes(maximumPaths), []);
+  assert.deepEqual(codes(realLargeChange), []);
+
+  const maximumSerializedPaths = safeInput();
+  maximumSerializedPaths.changedPaths = exactDiffBoundaryPaths();
+  assert.equal(
+    Buffer.byteLength(`${maximumSerializedPaths.changedPaths.join("\0")}\0`),
+    MAX_BOUNDARY_BYTES,
+  );
+  assert.deepEqual(codes(maximumSerializedPaths), []);
+
+  const oversizedSerializedPaths = structuredClone(maximumSerializedPaths);
+  oversizedSerializedPaths.changedPaths[0] += "x";
+  assert.deepEqual(codes(oversizedSerializedPaths), ["diff-boundary"]);
 
   const maximumPathLength = safeInput();
   maximumPathLength.changedPaths = ["d".repeat(512)];
   assert.deepEqual(codes(maximumPathLength), []);
 
   for (const changedPaths of [
-    Array.from({ length: 257 }, (_, index) => `docs/${index}`),
     ["d".repeat(513)],
     [42],
     [""],
@@ -243,10 +265,8 @@ test("enforces every changed-path boundary without rejecting ordinary product pa
   }
 });
 
-test("protects every future base policy root but permits only the candidate workflow", () => {
+test("protects immutable policy roots and requires review only for routine inputs", () => {
   for (const protectedPath of [
-    "package.json",
-    "package-lock.json",
     "scripts/new-policy.mjs",
     "keys/new-root.pubkey",
     "macos/new-entitlement.plist",
@@ -262,6 +282,27 @@ test("protects every future base policy root but permits only the candidate work
           "protected-base policy code requires a separately audited bootstrap",
       },
     ]);
+  }
+
+  for (const routinePath of ["package.json", "package-lock.json"]) {
+    const unreviewed = safeInput();
+    unreviewed.changedPaths = [routinePath];
+    assert.deepEqual(auditAnchoredPullRequestData(unreviewed), [
+      {
+        code: "protected-input-review",
+        message: "routine protected inputs require a head-bound independent review",
+      },
+    ]);
+
+    const reviewed = structuredClone(unreviewed);
+    reviewed.routineProtectedChangeApproved = true;
+    assert.deepEqual(auditAnchoredPullRequestData(reviewed), []);
+  }
+
+  for (const invalid of [undefined, null, "true", 1, {}]) {
+    const input = safeInput();
+    input.routineProtectedChangeApproved = invalid;
+    assert.deepEqual(codes(input), ["approval-boundary"]);
   }
   assert.deepEqual(codes(safeInput()), []);
 });
@@ -360,6 +401,7 @@ test("CLI reads bounded files, preserves NUL path records, and exposes exit stat
     "100644",
     String(size),
     candidatePath,
+    "false",
   ];
 
   const valid = await runEvaluator(argumentsFor());
@@ -395,7 +437,7 @@ test("CLI reads bounded files, preserves NUL path records, and exposes exit stat
   assert.equal(wrongArguments.stdout, "");
   assert.equal(
     wrongArguments.stderr,
-    "anchored-policy: usage: anchored-policy.mjs BASE_SHA HEAD_SHA DIFF_Z MODE SIZE CANDIDATE.yml\n",
+    "anchored-policy: usage: anchored-policy.mjs BASE_SHA HEAD_SHA DIFF_Z MODE SIZE CANDIDATE.yml ROUTINE_REVIEWED\n",
   );
 
   const directoryInput = join(directory, "not-a-file");
@@ -407,6 +449,7 @@ test("CLI reads bounded files, preserves NUL path records, and exposes exit stat
     "100644",
     String(Buffer.byteLength(releaseWorkflow)),
     candidatePath,
+    "false",
   ]);
   assert.equal(nonFile.status, 1);
   assert.equal(
@@ -432,19 +475,20 @@ test("CLI accepts exact reader ceilings and rejects the first oversized byte", a
     "100644",
     String(MAX_BOUNDARY_BYTES),
     candidatePath,
+    "false",
   ];
   assert.equal((await runEvaluator(baseArguments)).status, 0);
 
-  await writeFile(diffPath, Buffer.alloc(MAX_BOUNDARY_BYTES));
+  const exactPaths = exactDiffBoundaryPaths();
+  const exactBytes = Buffer.from(`${exactPaths.join("\0")}\0`);
+  assert.equal(exactBytes.length, MAX_BOUNDARY_BYTES);
+  await writeFile(diffPath, exactBytes);
   const exactDiff = await runEvaluator(baseArguments);
-  assert.equal(exactDiff.status, 1);
-  assert.deepEqual(
-    JSON.parse(exactDiff.stdout).diagnostics.map(({ code }) => code),
-    ["diff-boundary"],
-  );
+  assert.equal(exactDiff.status, 0);
+  assert.deepEqual(JSON.parse(exactDiff.stdout).diagnostics, []);
   assert.equal(exactDiff.stderr, "");
 
-  await writeFile(diffPath, Buffer.alloc(MAX_BOUNDARY_BYTES + 1));
+  await writeFile(diffPath, Buffer.concat([exactBytes, Buffer.from("x")]));
   const oversizedDiff = await runEvaluator(baseArguments);
   assert.equal(oversizedDiff.status, 1);
   assert.equal(oversizedDiff.stdout, "");
@@ -459,6 +503,7 @@ test("CLI accepts exact reader ceilings and rejects the first oversized byte", a
     ...baseArguments.slice(0, 4),
     String(MAX_BOUNDARY_BYTES + 1),
     candidatePath,
+    "false",
   ]);
   assert.equal(oversizedCandidate.status, 1);
   assert.equal(oversizedCandidate.stdout, "");

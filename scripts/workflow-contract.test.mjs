@@ -618,8 +618,8 @@ describe("ZergMeeting release workflow contract", () => {
   it("binds every channel to a distinct embedded and signing trust root", () => {
     assert.match(workflow, /keys\/zergmeeting-preview-updater\.pubkey/);
     assert.match(workflow, /keys\/zergmeeting-stable-updater\.pubkey/);
-    assert.match(workflow, /updater-preview\.pubkey/);
-    assert.match(workflow, /updater-stable\.pubkey/);
+    assert.match(workflow, /updater\.preview\.pubkey/);
+    assert.match(workflow, /updater\.stable\.pubkey/);
     assert.doesNotMatch(workflow, /keys\/zergmeeting-updater-v2\.pubkey/);
     assert.doesNotMatch(workflow, /src-tauri\/updater-v2\.pubkey/);
   });
