@@ -1066,6 +1066,54 @@ test("release-data has one bounded root topology shared with feed publication", 
   assert.deepEqual(errorCodes(exactLimit), ["feed-branch-contract"]);
 });
 
+test("release-data validates each path, size, and channel-completeness boundary", () => {
+  const unexpectedPath = idealState();
+  unexpectedPath.release.feedBranch.entries.push({
+    path: "unexpected.txt",
+    mode: "100644",
+    type: "blob",
+    size: 1,
+  });
+  assert.deepEqual(errorCodes(unexpectedPath), ["feed-branch-contract"]);
+
+  const prefix = "preview/releases/";
+  const suffix = ".2.3-preview.1.json";
+  const exactPath = `${prefix}${"1".repeat(512 - prefix.length - suffix.length)}${suffix}`;
+  assert.equal(exactPath.length, 512);
+  const exactPathLimit = idealState();
+  exactPathLimit.release.feedBranch.entries.at(-1).path = exactPath;
+  assert.equal(
+    errorCodes(exactPathLimit).includes("feed-branch-contract"),
+    false,
+  );
+
+  const oversizedPath = idealState();
+  oversizedPath.release.feedBranch.entries.at(-1).path =
+    `${prefix}${"1".repeat(513 - prefix.length - suffix.length)}${suffix}`;
+  assert.equal(oversizedPath.release.feedBranch.entries.at(-1).path.length, 513);
+  assert.deepEqual(errorCodes(oversizedPath), ["feed-branch-contract"]);
+
+  const negativeSize = idealState();
+  negativeSize.release.feedBranch.entries.at(-1).size = -1;
+  assert.deepEqual(errorCodes(negativeSize), ["feed-branch-contract"]);
+
+  const incompletePreview = idealState();
+  incompletePreview.release.feedBranch.entries = [
+    ...rootReleaseDataEntries(),
+    { path: "preview", mode: "040000", type: "tree" },
+  ];
+  assert.deepEqual(errorCodes(incompletePreview), ["feed-branch-contract"]);
+
+  const stableWithoutMetadata = idealState();
+  stableWithoutMetadata.release.feedBranch.entries = [
+    ...rootReleaseDataEntries(),
+    { path: "stable", mode: "040000", type: "tree" },
+    { path: "stable/latest.json", mode: "100644", type: "blob", size: 2_048 },
+    { path: "stable/releases", mode: "040000", type: "tree" },
+  ];
+  assert.deepEqual(errorCodes(stableWithoutMetadata), ["feed-branch-contract"]);
+});
+
 test("invalid phases and repository documents throw exact public errors", () => {
   assert.throws(
     () => auditRepositoryState({}, { phase: "preview" }),
@@ -1176,6 +1224,43 @@ test("the GitHub boundary collects every authenticated pagination page", async (
     `${base}?per_page=100`,
     `${base}?page=2&per_page=100`,
   ]);
+});
+
+test("object pagination rejects a total count that changes between pages", async () => {
+  const base =
+    "https://api.github.com/repos/Epoch-ML/zergmeeting-releases/actions/workflows";
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return calls === 1
+      ? {
+          ok: true,
+          status: 200,
+          headers: new Headers({
+            link: `<${base}?page=2&per_page=100>; rel="next"`,
+          }),
+          json: async () => ({ total_count: 1, workflows: [{ id: 1 }] }),
+        }
+      : {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ total_count: 2, workflows: [{ id: 2 }] }),
+        };
+  };
+
+  await assert.rejects(
+    requestGitHub({
+      repository: "Epoch-ML/zergmeeting-releases",
+      path: "actions/workflows",
+      paginationKey: "workflows",
+    }, { token: "test-token", fetchImpl }),
+    (error) => error instanceof RepositoryPreflightError &&
+      error.message ===
+        "GitHub API Epoch-ML/zergmeeting-releases/actions/workflows " +
+          "pagination total_count changed between pages",
+  );
+  assert.equal(calls, 2);
 });
 
 test("array pagination and hostile Link metadata fail closed", async () => {
@@ -1867,6 +1952,20 @@ test("the collector normalizes settings through one injected HTTP boundary", asy
     );
     responses.set(key, original);
   }
+
+  const rulesetKey = "Epoch-ML/zergmeeting-releases:rulesets/1";
+  const originalRuleset = responses.get(rulesetKey);
+  responses.set(rulesetKey, {
+    ...originalRuleset,
+    rules: [{ type: "update", parameters: { unexpected: true } }],
+  });
+  await assert.rejects(
+    collectRepositoryState({ request }),
+    (error) => error instanceof RepositoryPreflightError &&
+      error.message ===
+        "repository update rule must not define unreviewed parameters",
+  );
+  responses.set(rulesetKey, originalRuleset);
 
   const deployKeyBytesWith = (mutate) => {
     const bytes = Buffer.from(testDeployKeyBlob);
