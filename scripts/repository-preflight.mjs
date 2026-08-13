@@ -1401,10 +1401,20 @@ export async function collectRepositoryState({
     path: "environments",
     paginationKey: "environments",
   });
+  const sourceEnvironmentRecords = requireArray(
+    sourceEnvironmentResponse.environments,
+    "source repository environments",
+  ).filter((rawRecord) => {
+    const record = requireObject(rawRecord, "source repository environment");
+    return requireString(
+      record.name,
+      "source repository environment name",
+    ) === "zergmeeting-release-request";
+  });
   const sourceEnvironments = await collectEnvironments(
     request,
     sourceRepository,
-    sourceEnvironmentResponse,
+    { environments: sourceEnvironmentRecords },
   );
   const sourceRepositorySecretsResponse = await request({
     repository: sourceRepository,
