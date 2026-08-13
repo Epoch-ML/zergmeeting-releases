@@ -206,7 +206,11 @@ describe("ZergMeeting release workflow contract", () => {
   it("tests, audits, signs, and verifies before publishing", () => {
     assert.match(
       workflow,
-      /npm audit --omit=dev --audit-level=moderate --prefix source\/zapps\/zergmeeting/,
+      /npm run audit:web-production --prefix source\/zapps\/zergmeeting/,
+    );
+    assert.match(
+      workflow,
+      /npm --prefix source\/ztc audit --omit=dev --audit-level=moderate/,
     );
     assert.match(workflow, /cargo-audit --version 0\.22\.2/);
     assert.match(workflow, /npm test/);
@@ -721,10 +725,13 @@ describe("ZergMeeting release workflow contract", () => {
     );
     assert.doesNotMatch(workflow, /cargo install minisign/);
     assert.doesNotMatch(workflow, /npm audit --omit=dev --audit-level=high/);
-    assert.match(workflow, /npm audit --omit=dev --audit-level=moderate/);
     assert.match(
       workflow,
-      /npm audit --omit=dev --audit-level=moderate --prefix source\/zapps\/zergmeeting/,
+      /npm --prefix source\/ztc audit --omit=dev --audit-level=moderate/,
+    );
+    assert.match(
+      workflow,
+      /npm run audit:web-production --prefix source\/zapps\/zergmeeting/,
     );
     assert.equal(
       workflow.match(/npm audit --audit-level=moderate/g)?.length,
