@@ -1,0 +1,1978 @@
+name: Publish ZergMeeting Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Request path, for example requests/zergmeeting-preview-v0.2.0-preview.1.json
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zergmeeting-v2-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate immutable request
+    runs-on: ubuntu-24.04
+    outputs:
+      channel: ${{ steps.request.outputs.channel }}
+      request_commit: ${{ steps.select.outputs.request_commit }}
+      request_path: ${{ steps.select.outputs.request_path }}
+      requested_at: ${{ steps.request.outputs.requested_at }}
+      release_tag: ${{ steps.request.outputs.release_tag }}
+      source_ref: ${{ steps.request.outputs.source_ref }}
+      source_repository: ${{ steps.request.outputs.source_repository }}
+      source_sha: ${{ steps.request.outputs.source_sha }}
+      updater_public_key_sha256: ${{ steps.request.outputs.updater_public_key_sha256 }}
+      version: ${{ steps.request.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+
+      - name: Install and test the public request validator
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm audit --audit-level=moderate
+          npm test
+
+      - id: select
+        name: Select exactly one request
+        shell: bash
+        env:
+          DISPATCH_REQUEST: ${{ inputs.request }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Public releases must be manually dispatched from refs/heads/main."
+            exit 1
+          fi
+          request_path="$DISPATCH_REQUEST"
+          if [[ ! "$request_path" =~ ^requests/zergmeeting-(preview-)?v[0-9A-Za-z.+-]+\.json$ ]]; then
+            echo "::error::Invalid ZergMeeting release request path."
+            exit 1
+          fi
+          if [[ ! -f "$request_path" || -L "$request_path" ]]; then
+            echo "::error::The request must be a regular, non-symlink file."
+            exit 1
+          fi
+
+          mapfile -t addition_commits < <(
+            git log --format=%H --diff-filter=A -- "$request_path"
+          )
+          if [[ "${#addition_commits[@]}" -ne 1 ]]; then
+            echo "::error::The request must have exactly one immutable addition commit."
+            exit 1
+          fi
+          request_commit="${addition_commits[0]}"
+          git merge-base --is-ancestor "$request_commit" "$GITHUB_SHA"
+          read -r -a commit_and_parents <<<"$(git rev-list --parents -n 1 "$request_commit")"
+          if [[ "${#commit_and_parents[@]}" -ne 2 ]]; then
+            echo "::error::The request addition must be a single-parent commit."
+            exit 1
+          fi
+          mapfile -d '' -t addition_changes < <(
+            git diff --name-status --no-renames -z \
+              "${request_commit}^" \
+              "$request_commit"
+          )
+          if [[
+            "${#addition_changes[@]}" -ne 2 ||
+            "${addition_changes[0]}" != "A" ||
+            "${addition_changes[1]}" != "$request_path"
+          ]]; then
+            echo "::error::The request addition commit must add only this request."
+            exit 1
+          fi
+          request_mode="$(git ls-tree "$request_commit" -- "$request_path" | cut -d ' ' -f 1)"
+          if [[ "$request_mode" != "100644" ]]; then
+            echo "::error::The immutable request must be a normal non-executable file."
+            exit 1
+          fi
+          addition_bytes="$RUNNER_TEMP/zergmeeting-request-at-addition.json"
+          git show "${request_commit}:${request_path}" >"$addition_bytes"
+          if ! cmp --silent "$request_path" "$addition_bytes"; then
+            echo "::error::Request bytes changed after their immutable addition commit."
+            exit 1
+          fi
+
+          {
+            echo "request_commit=$request_commit"
+            echo "request_path=$request_path"
+          } >>"$GITHUB_OUTPUT"
+
+      - id: request
+        name: Validate request schema and provenance
+        run: node scripts/release-request.mjs "${{ steps.select.outputs.request_path }}"
+
+      - name: Bind the request to the channel updater root
+        env:
+          RELEASE_CHANNEL: ${{ steps.request.outputs.channel }}
+          REQUEST_UPDATER_PUBLIC_KEY_SHA256: ${{ steps.request.outputs.updater_public_key_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_CHANNEL" == "stable" ]]; then
+            key_path="keys/zergmeeting-stable-updater.pubkey"
+          else
+            key_path="keys/zergmeeting-preview-updater.pubkey"
+          fi
+          if [[ ! -f "$key_path" || -L "$key_path" ]]; then
+            echo "::error::The selected updater root must be a regular non-symlink file."
+            exit 1
+          fi
+          KEY_PATH="$key_path" node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { readFile } from "node:fs/promises";
+
+          const encoded = (await readFile(process.env.KEY_PATH, "utf8")).trim();
+          assert.match(encoded, /^[A-Za-z0-9+/]+={0,2}$/, "updater root must be canonical base64");
+          assert.equal(Buffer.from(encoded, "base64").toString("base64"), encoded, "updater root must use canonical base64");
+          const digest = createHash("sha256").update(encoded).digest("hex");
+          assert.equal(digest, process.env.REQUEST_UPDATER_PUBLIC_KEY_SHA256, "request updater root digest mismatch");
+          NODE
+
+      - name: Require the pre-existing public release tag at the request commit
+        env:
+          RELEASE_TAG: ${{ steps.request.outputs.release_tag }}
+          REQUEST_COMMIT: ${{ steps.select.outputs.request_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_tag_refs="$RUNNER_TEMP/zergmeeting-public-tag-refs.txt"
+          if ! git ls-remote --exit-code --tags origin \
+            "refs/tags/$RELEASE_TAG" \
+            "refs/tags/$RELEASE_TAG^{}" >"$remote_tag_refs"; then
+            echo "::error::Create the protected public $RELEASE_TAG tag before dispatching."
+            exit 1
+          fi
+          test -s "$remote_tag_refs"
+          git fetch --force --no-tags origin \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tag_target="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          request_commit="$REQUEST_COMMIT"
+          if [[ "$tag_target" != "$request_commit" ]]; then
+            echo "::error::Public tag $RELEASE_TAG resolves to $tag_target, not request commit $request_commit."
+            exit 1
+          fi
+
+  build-macos:
+    name: Verify source, then build Apple Silicon macOS
+    needs: [validate]
+    runs-on: macos-15
+    environment:
+      name: ${{ needs.validate.outputs.channel == 'stable' && 'zergmeeting-stable-build' || 'zergmeeting-preview-build' }}
+    env:
+      CARGO_TERM_COLOR: always
+      SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
+      SOURCE_REPOSITORY: ${{ needs.validate.outputs.source_repository }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: release-repository
+          persist-credentials: false
+
+      - name: Check out the exact SHA and matching source tag
+        env:
+          GITHUB_META_TOKEN: ${{ github.token }}
+          SOURCE_DEPLOY_KEY: ${{ secrets.ZERG_SOURCE_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOURCE_DEPLOY_KEY" ]]; then
+            echo "::error::The environment-scoped ZERG_SOURCE_DEPLOY_KEY is not configured."
+            exit 1
+          fi
+          secure_dir="$RUNNER_TEMP/zergmeeting-build-source-ssh"
+          install -d -m 700 "$secure_dir"
+          key_path="$secure_dir/deploy-key"
+          known_hosts="$secure_dir/known_hosts"
+          install -m 600 /dev/null "$key_path"
+          trap 'rm -f "$key_path"' EXIT
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" >"$key_path"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            --header "Authorization: Bearer $GITHUB_META_TOKEN" \
+            https://api.github.com/meta \
+            | jq -er '.ssh_keys | if length > 0 then .[] else error("no GitHub SSH keys") end | "github.com " + .' \
+            >"$known_hosts"
+          chmod 600 "$known_hosts"
+          ssh_command="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+
+          git init source
+          git -C source remote add origin "git@github.com:${SOURCE_REPOSITORY}.git"
+          GIT_SSH_COMMAND="$ssh_command" git -C source fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          GIT_SSH_COMMAND="$ssh_command" git -C source fetch --no-tags --depth=1 origin \
+            "${SOURCE_REF}:${SOURCE_REF}"
+          unset SOURCE_DEPLOY_KEY GITHUB_META_TOKEN
+          rm -f "$key_path"
+          tag_sha="$(git -C source rev-parse "${SOURCE_REF}^{commit}")"
+          if [[ "$tag_sha" != "$SOURCE_SHA" ]]; then
+            echo "::error::$SOURCE_REF resolves to $tag_sha, not requested SHA $SOURCE_SHA."
+            exit 1
+          fi
+          GIT_LFS_SKIP_SMUDGE=1 git -C source checkout --detach "$SOURCE_SHA"
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test -f source/zapps/zergmeeting/package-lock.json
+
+      - name: Delete ephemeral source deploy key
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/zergmeeting-build-source-ssh/deploy-key"
+
+      - name: Bind source media capabilities to the public entitlement contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          public_entitlements="release-repository/macos/ZergMeeting.entitlements.plist"
+          source_entitlements="source/zapps/zergmeeting/src-tauri/Entitlements.plist"
+          source_config="source/zapps/zergmeeting/src-tauri/tauri.conf.json"
+          source_info="source/zapps/zergmeeting/src-tauri/Info.plist"
+          test -f "$public_entitlements" && test ! -L "$public_entitlements"
+          test -f "$source_entitlements" && test ! -L "$source_entitlements"
+          test -f "$source_config" && test ! -L "$source_config"
+          test -f "$source_info" && test ! -L "$source_info"
+          TAURI_CONFIG="$source_config" node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile } from "node:fs/promises";
+
+          const config = JSON.parse(
+            await readFile(process.env.TAURI_CONFIG, "utf8"),
+          );
+          assert.equal(config.build.beforeBuildCommand, "npm run release:stage");
+          assert.equal(config.bundle.macOS.entitlements, "Entitlements.plist");
+          assert.equal(config.bundle.macOS.infoPlist, "Info.plist");
+          NODE
+          for key in \
+            NSMicrophoneUsageDescription \
+            NSScreenCaptureUsageDescription \
+            NSAppleEventsUsageDescription; do
+            description="$(/usr/libexec/PlistBuddy -c "Print :$key" "$source_info")"
+            test -n "$description"
+          done
+          cmp --silent "$public_entitlements" "$source_entitlements"
+
+      - name: Compare both tag-selected updater keys with independent trust roots
+        run: |
+          set -euo pipefail
+          cmp --silent \
+            release-repository/keys/zergmeeting-preview-updater.pubkey \
+            source/zapps/zergmeeting/src-tauri/updater-preview.pubkey
+          cmp --silent \
+            release-repository/keys/zergmeeting-stable-updater.pubkey \
+            source/zapps/zergmeeting/src-tauri/updater-stable.pubkey
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+          cache: npm
+          cache-dependency-path: source/zapps/zergmeeting/package-lock.json
+
+      - name: Verify the deterministic source commit timestamp
+        env:
+          ZERGMEETING_RELEASE_DATE: ${{ needs.validate.outputs.requested_at }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit_epoch="$(git -C source show -s --format=%ct "$SOURCE_SHA")"
+          source_commit_requested_at="$(node -e \
+            'process.stdout.write(new Date(Number(process.argv[1]) * 1000).toISOString())' \
+            "$source_commit_epoch")"
+          if [[ "$source_commit_requested_at" != "$ZERGMEETING_RELEASE_DATE" ]]; then
+            echo "::error::Request timestamp does not match the exact source commit timestamp."
+            exit 1
+          fi
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.88.0 \
+            --profile minimal \
+            --component clippy,rustfmt \
+            --target aarch64-apple-darwin
+          rustup default 1.88.0
+
+      - name: Install locked dependencies and security tooling
+        run: |
+          set -euo pipefail
+          npm ci --prefix source/zapps/zergmeeting
+          npm ci --ignore-scripts --prefix release-repository
+          (
+            cd release-repository
+            npm audit --audit-level=moderate
+            npm test
+          )
+          cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Test and audit the exact source
+        run: |
+          set -euo pipefail
+          npm audit --omit=dev --audit-level=moderate --prefix source/zapps/zergmeeting
+          cargo audit --file source/zapps/zergmeeting/src-tauri/Cargo.lock
+          npm run test:release --prefix source/zapps/zergmeeting
+          npm run test:meeting-runtime --prefix source/zapps/zergmeeting
+          npm run typecheck --prefix source/zapps/zergmeeting
+          npm run build --prefix source/zapps/zergmeeting
+          cargo test --locked --manifest-path source/zapps/zergmeeting/src-tauri/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path source/zapps/zergmeeting/src-tauri/Cargo.toml -- -D warnings
+          cargo fmt --all --manifest-path source/zapps/zergmeeting/src-tauri/Cargo.toml -- --check
+
+      - name: Stage and verify the pinned standalone meeting runtime
+        env:
+          ZERGMEETING_NODE_ARCHIVE: ${{ runner.temp }}/node-v22.23.2-darwin-arm64.tar.gz
+          ZERGMEETING_NODE_SHA256: 61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6
+        working-directory: source/zapps/zergmeeting
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            https://nodejs.org/dist/v22.23.2/node-v22.23.2-darwin-arm64.tar.gz \
+            --output "$ZERGMEETING_NODE_ARCHIVE"
+          printf '%s  %s\n' \
+            "$ZERGMEETING_NODE_SHA256" \
+            "$ZERGMEETING_NODE_ARCHIVE" \
+            | shasum -a 256 -c -
+          npm run release:stage
+          stage="dist/release-stage"
+          test -d "$stage" && test ! -L "$stage"
+          if find "$stage" -type l -print -quit | grep -q .; then
+            echo "::error::Standalone meeting runtime contains a symbolic link."
+            exit 1
+          fi
+
+      - name: Write and verify the ZergMeeting release configuration
+        env:
+          ZERGMEETING_UPDATE_CHANNEL: ${{ needs.validate.outputs.channel }}
+          ZERGMEETING_VERSION: ${{ needs.validate.outputs.version }}
+        working-directory: source/zapps/zergmeeting
+        run: |
+          set -euo pipefail
+          npm run release:config
+          if [[ "$ZERGMEETING_UPDATE_CHANNEL" == "stable" ]]; then
+            key_name="updater-stable.pubkey"
+            trust_name="zergmeeting-stable-updater.pubkey"
+          else
+            key_name="updater-preview.pubkey"
+            trust_name="zergmeeting-preview-updater.pubkey"
+          fi
+          RELEASE_COMMITTED_KEY="$key_name" \
+          RELEASE_TRUST_ROOT="$GITHUB_WORKSPACE/release-repository/keys/$trust_name" \
+            node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile } from "node:fs/promises";
+
+          const config = JSON.parse(await readFile("src-tauri/tauri.release.conf.json", "utf8"));
+          const committedKey = await readFile("src-tauri/" + process.env.RELEASE_COMMITTED_KEY);
+          const trustedKey = await readFile(process.env.RELEASE_TRUST_ROOT);
+          assert.equal(Buffer.compare(committedKey, trustedKey), 0);
+          assert.equal(config.productName, "Zerg Meeting");
+          assert.equal(config.identifier, "com.zergai.meeting");
+          assert.equal(config.version, process.env.ZERGMEETING_VERSION);
+          assert.deepEqual(config.plugins.updater.endpoints, [
+            "https://epoch-ml.github.io/zergmeeting-releases/" + process.env.ZERGMEETING_UPDATE_CHANNEL + "/latest.json",
+          ]);
+          assert.equal(config.plugins.updater.pubkey, committedKey.toString("utf8").trim());
+          assert.equal(config.bundle.createUpdaterArtifacts, false);
+          NODE
+
+      - name: Build the unsigned app without release signing credentials
+        env:
+          ZERGMEETING_NODE_ARCHIVE: ${{ runner.temp }}/node-v22.23.2-darwin-arm64.tar.gz
+          ZERGMEETING_NODE_SHA256: 61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6
+        working-directory: source/zapps/zergmeeting
+        run: |
+          set -euo pipefail
+          npm run tauri:build -- \
+            --ci \
+            --target aarch64-apple-darwin \
+            --bundles app \
+            --no-sign \
+            --skip-stapling \
+            --config src-tauri/tauri.release.conf.json
+
+      - name: Verify the exact bundled ZergMeeting release assets
+        working-directory: source/zapps/zergmeeting
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Zerg Meeting.app"
+          for executable in \
+            "$app/Contents/MacOS/zergmeeting" \
+            "$app/Contents/MacOS/node-aarch64-apple-darwin" \
+            "$app/Contents/MacOS/ztc-capture-aarch64-apple-darwin"; do
+            test -f "$executable" && test ! -L "$executable" && test -x "$executable"
+          done
+          resources="$app/Contents/Resources/desktop-runtime"
+          for path in \
+            "$resources/meeting-bridge.mjs" \
+            "$resources/dist/runtime" \
+            "$resources/dist/modes" \
+            "$resources/node_modules/.bin/ztc" \
+            "$resources/node_modules/zerg-ztc"; do
+            test -e "$path" && test ! -L "$path"
+          done
+          if find "$resources" -type l -print -quit | grep -q .; then
+            echo "::error::Bundled ZergMeeting runtime contains a symbolic link."
+            exit 1
+          fi
+          test "$("$app/Contents/MacOS/node-aarch64-apple-darwin" --version)" = "v22.23.2"
+
+      - name: Package a bounded unsigned source stage
+        env:
+          ZERGMEETING_DESKTOP_VERSION: ${{ needs.validate.outputs.version }}
+          ZERGMEETING_RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          ZERGMEETING_SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          ZERGMEETING_UPDATE_CHANNEL: ${{ needs.validate.outputs.channel }}
+        working-directory: source/zapps/zergmeeting
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_root="src-tauri/target/aarch64-apple-darwin/release/bundle"
+          apps=()
+          while IFS= read -r path; do
+            apps+=("$path")
+          done < <(find "$bundle_root/macos" -maxdepth 1 -type d -name '*.app' -print)
+          if [[ "${#apps[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one unsigned source-built app."
+            exit 1
+          fi
+
+          source_stage="dist/source-stage"
+          mkdir -p "$source_stage"
+          archive="$source_stage/ZergMeeting_${ZERGMEETING_DESKTOP_VERSION}_aarch64.source.app.tar.gz"
+          node "$GITHUB_WORKSPACE/release-repository/scripts/package-macos.mjs" \
+            "${apps[0]}" \
+            "$archive"
+          if [[ "$ZERGMEETING_UPDATE_CHANNEL" == "stable" ]]; then
+            key_name="updater-stable.pubkey"
+          else
+            key_name="updater-preview.pubkey"
+          fi
+          cp "src-tauri/$key_name" "$source_stage/updater.pubkey"
+
+          node --input-type=module <<'NODE'
+          import { writeFile } from "node:fs/promises";
+
+          const metadata = {
+            schema_version: 2,
+            product: "Zerg Meeting",
+            version: process.env.ZERGMEETING_DESKTOP_VERSION,
+            channel: process.env.ZERGMEETING_UPDATE_CHANNEL,
+            release_tag: process.env.ZERGMEETING_RELEASE_TAG,
+            source_sha: process.env.ZERGMEETING_SOURCE_SHA,
+            platform: "darwin-aarch64",
+            apple_signature: "none",
+          };
+          await writeFile(
+            "dist/source-stage/build-metadata.json",
+            JSON.stringify(metadata, null, 2) + "\n",
+          );
+          NODE
+          test -s "$archive"
+          test -s "$source_stage/build-metadata.json"
+          test -s "$source_stage/updater.pubkey"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zergmeeting-v2-unsigned-source-stage
+          path: source/zapps/zergmeeting/dist/source-stage/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  apple-sign:
+    name: Sign and notarize on a fresh public-code runner
+    needs:
+      - validate
+      - build-macos
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    environment:
+      name: ${{ needs.validate.outputs.channel == 'stable' && 'zergmeeting-apple-stable' || 'zergmeeting-apple-preview' }}
+    env:
+      CHANNEL: ${{ needs.validate.outputs.channel }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      REQUEST_PATH: ${{ needs.validate.outputs.request_path }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+          cache: npm
+
+      - name: Test trusted public signing policy before handling source output
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
+          npm test
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-unsigned-source-stage
+          path: source-stage
+
+      - id: source-stage
+        name: Verify and extract the hostile source stage
+        env:
+          ZERGMEETING_STAGE_MAX_ARCHIVE_BYTES: "1073741824"
+          ZERGMEETING_STAGE_MAX_ENTRY_COUNT: "16384"
+          ZERGMEETING_STAGE_MAX_FILE_BYTES: "536870912"
+          ZERGMEETING_STAGE_MAX_UNCOMPRESSED_BYTES: "2147483648"
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/release-request.mjs "$REQUEST_PATH"
+          source_archive="source-stage/ZergMeeting_${VERSION}_aarch64.source.app.tar.gz"
+          test -f "$source_archive" && test ! -L "$source_archive"
+          node scripts/extract-macos-stage.mjs \
+            "$REQUEST_PATH" \
+            source-stage \
+            "$RUNNER_TEMP/zergmeeting-apple-input"
+          app="$RUNNER_TEMP/zergmeeting-apple-input/Zerg Meeting.app"
+          plist="$app/Contents/Info.plist"
+          test -d "$app" && test ! -L "$app"
+          test -f "$plist" && test ! -L "$plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = \
+            "com.zergai.meeting"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = \
+            "$VERSION"
+          architectures="$(lipo -archs "$app/Contents/MacOS/zergmeeting")"
+          test "$(wc -w <<<"$architectures" | tr -d ' ')" -eq 1
+          grep -qw arm64 <<<"$architectures"
+
+          signature_details="$RUNNER_TEMP/zergmeeting-source-signature.txt"
+          codesign_status=0
+          codesign -dv --verbose=4 "$app" >"$signature_details" 2>&1 || \
+            codesign_status=$?
+          node scripts/verify-source-signature.mjs \
+            "$signature_details" \
+            "$codesign_status"
+
+      - name: Apply preview ad-hoc or fail-closed stable Apple signing
+        env:
+          ZERGMEETING_APPLE_API_ISSUER: ${{ secrets.ZERGMEETING_APPLE_API_ISSUER }}
+          ZERGMEETING_APPLE_API_KEY_ID: ${{ secrets.ZERGMEETING_APPLE_API_KEY_ID }}
+          ZERGMEETING_APPLE_API_PRIVATE_KEY: ${{ secrets.ZERGMEETING_APPLE_API_PRIVATE_KEY }}
+          ZERGMEETING_APPLE_CERTIFICATE: ${{ secrets.ZERGMEETING_APPLE_CERTIFICATE }}
+          ZERGMEETING_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.ZERGMEETING_APPLE_CERTIFICATE_PASSWORD }}
+          ZERGMEETING_APPLE_SIGNING_IDENTITY: ${{ secrets.ZERGMEETING_APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/zergmeeting-apple-input/Zerg Meeting.app"
+          identity="-"
+          api_key_path=""
+          if [[ "$CHANNEL" == "stable" ]]; then
+            required=(
+              ZERGMEETING_APPLE_CERTIFICATE
+              ZERGMEETING_APPLE_CERTIFICATE_PASSWORD
+              ZERGMEETING_APPLE_SIGNING_IDENTITY
+              ZERGMEETING_APPLE_API_ISSUER
+              ZERGMEETING_APPLE_API_KEY_ID
+              ZERGMEETING_APPLE_API_PRIVATE_KEY
+            )
+            missing=()
+            for name in "${required[@]}"; do
+              if [[ -z "${!name:-}" ]]; then missing+=("$name"); fi
+            done
+            if [[ "${#missing[@]}" -ne 0 ]]; then
+              echo "::error::zergmeeting-apple-stable is missing: ${missing[*]}"
+              exit 1
+            fi
+            if [[ ! "$ZERGMEETING_APPLE_API_KEY_ID" =~ ^[0-9A-Za-z]{10,32}$ ]]; then
+              echo "::error::ZERGMEETING_APPLE_API_KEY_ID is malformed."
+              exit 1
+            fi
+            if [[ ! "$ZERGMEETING_APPLE_API_ISSUER" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+              echo "::error::ZERGMEETING_APPLE_API_ISSUER is malformed."
+              exit 1
+            fi
+
+            certificate_path="$RUNNER_TEMP/zergmeeting-developer-id.p12"
+            api_key_path="$RUNNER_TEMP/AuthKey_${ZERGMEETING_APPLE_API_KEY_ID}.p8"
+            keychain_path="$RUNNER_TEMP/zergmeeting-release.keychain-db"
+            original_keychain_path="$RUNNER_TEMP/zergmeeting-original-default-keychain"
+            security default-keychain -d user | tr -d '"' >"$original_keychain_path"
+            keychain_password="$(openssl rand -hex 32)"
+            echo "::add-mask::$keychain_password"
+            CERTIFICATE_PATH="$certificate_path" node -e \
+              'const fs=require("node:fs"); const value=process.env.ZERGMEETING_APPLE_CERTIFICATE.replace(/\s/g, ""); const bytes=Buffer.from(value, "base64"); if (!bytes.length) throw new Error("empty Apple certificate"); fs.writeFileSync(process.env.CERTIFICATE_PATH, bytes, {mode: 0o600});'
+            install -m 600 /dev/null "$api_key_path"
+            printf '%s\n' "$ZERGMEETING_APPLE_API_PRIVATE_KEY" >"$api_key_path"
+            grep -F "BEGIN PRIVATE KEY" "$api_key_path" >/dev/null
+
+            security create-keychain -p "$keychain_password" "$keychain_path"
+            security set-keychain-settings -lut 21600 "$keychain_path"
+            security unlock-keychain -p "$keychain_password" "$keychain_path"
+            security import "$certificate_path" \
+              -k "$keychain_path" \
+              -P "$ZERGMEETING_APPLE_CERTIFICATE_PASSWORD" \
+              -T /usr/bin/codesign \
+              -T /usr/bin/security
+            security set-key-partition-list \
+              -S apple-tool:,apple:,codesign: \
+              -s -k "$keychain_password" "$keychain_path"
+            security list-keychains -d user -s "$keychain_path"
+            security default-keychain -d user -s "$keychain_path"
+            security find-identity -v -p codesigning "$keychain_path" \
+              | grep -F -- "\"$ZERGMEETING_APPLE_SIGNING_IDENTITY\"" >/dev/null
+            identity="$ZERGMEETING_APPLE_SIGNING_IDENTITY"
+          fi
+
+          scripts/sign-macos-app.sh "$app" "$identity" "$CHANNEL" "$VERSION" \
+            macos/ZergMeeting.entitlements.plist
+
+          signed_entitlements="$RUNNER_TEMP/zergmeeting-signed-entitlements.plist"
+          signed_entitlements_json="$RUNNER_TEMP/zergmeeting-signed-entitlements.json"
+          codesign -d --entitlements - --xml "$app" >"$signed_entitlements"
+          test -s "$signed_entitlements"
+          plutil -convert json -o "$signed_entitlements_json" "$signed_entitlements"
+          SIGNED_ENTITLEMENTS_JSON="$signed_entitlements_json" \
+            node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile } from "node:fs/promises";
+
+          const actual = JSON.parse(
+            await readFile(process.env.SIGNED_ENTITLEMENTS_JSON, "utf8"),
+          );
+          const expected = {
+            "com.apple.security.app-sandbox": false,
+            "com.apple.security.network.client": true,
+            "com.apple.security.device.audio-input": true,
+            "com.apple.security.cs.allow-jit": true,
+            "com.apple.security.cs.allow-unsigned-executable-memory": true,
+          };
+          assert.deepEqual(actual, expected);
+          NODE
+
+          if [[ "$CHANNEL" == "stable" ]]; then
+            app_zip="$RUNNER_TEMP/ZergMeeting-notarization.zip"
+            app_result="$RUNNER_TEMP/zergmeeting-app-notarization.json"
+            ditto -c -k --keepParent "$app" "$app_zip"
+            xcrun notarytool submit "$app_zip" \
+              --key "$api_key_path" \
+              --key-id "$ZERGMEETING_APPLE_API_KEY_ID" \
+              --issuer "$ZERGMEETING_APPLE_API_ISSUER" \
+              --wait --output-format json >"$app_result"
+            jq -e '.status == "Accepted"' "$app_result" >/dev/null
+            xcrun stapler staple "$app"
+            xcrun stapler validate "$app"
+          fi
+
+          output="$RUNNER_TEMP/zergmeeting-apple-output"
+          dmg_root="$RUNNER_TEMP/zergmeeting-dmg-root"
+          mkdir -p "$output" "$dmg_root"
+          ditto "$app" "$dmg_root/Zerg Meeting.app"
+          ln -s /Applications "$dmg_root/Applications"
+          dmg="$output/ZergMeeting_${VERSION}_aarch64.dmg"
+          hdiutil create \
+            -volname ZergMeeting \
+            -srcfolder "$dmg_root" \
+            -format UDZO \
+            -ov "$dmg"
+          if [[ "$CHANNEL" == "stable" ]]; then
+            codesign --force --timestamp --sign "$identity" "$dmg"
+          else
+            codesign --force --timestamp=none --sign - "$dmg"
+          fi
+          codesign --verify --strict --verbose=2 "$dmg"
+          hdiutil verify "$dmg" >/dev/null
+
+          if [[ "$CHANNEL" == "stable" ]]; then
+            dmg_result="$RUNNER_TEMP/zergmeeting-dmg-notarization.json"
+            xcrun notarytool submit "$dmg" \
+              --key "$api_key_path" \
+              --key-id "$ZERGMEETING_APPLE_API_KEY_ID" \
+              --issuer "$ZERGMEETING_APPLE_API_ISSUER" \
+              --wait --output-format json >"$dmg_result"
+            jq -e '.status == "Accepted"' "$dmg_result" >/dev/null
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            spctl --assess --type execute --verbose=4 "$app"
+            gatekeeper_output="$(spctl --assess --type open --context context:primary-signature \
+              --verbose=4 "$dmg" 2>&1)"
+            grep -F "source=Notarized Developer ID" <<<"$gatekeeper_output"
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --verify --strict --verbose=2 "$dmg"
+
+      - name: Delete ephemeral Apple credentials
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          keychain_path="$RUNNER_TEMP/zergmeeting-release.keychain-db"
+          original_keychain_path="$RUNNER_TEMP/zergmeeting-original-default-keychain"
+          if [[ -s "$original_keychain_path" ]]; then
+            original_keychain="$(cat "$original_keychain_path")"
+            security list-keychains -d user -s "$original_keychain"
+            security default-keychain -d user -s "$original_keychain"
+          fi
+          if [[ -f "$keychain_path" ]]; then
+            security delete-keychain "$keychain_path"
+          fi
+          rm -f \
+            "$RUNNER_TEMP/zergmeeting-developer-id.p12" \
+            "$RUNNER_TEMP"/AuthKey_*.p8 \
+            "$RUNNER_TEMP/zergmeeting-original-default-keychain"
+
+      - name: Package the credential-free signed payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/zergmeeting-apple-input/Zerg Meeting.app"
+          output="$RUNNER_TEMP/zergmeeting-apple-output"
+          archive="$output/ZergMeeting_${VERSION}_aarch64.app.tar.gz"
+          dmg="$output/ZergMeeting_${VERSION}_aarch64.dmg"
+          test -d "$app" && test ! -L "$app"
+          test -f "$dmg" && test ! -L "$dmg"
+          node scripts/package-macos.mjs "$app" "$archive"
+          if [[ "$CHANNEL" == "stable" ]]; then
+            cp keys/zergmeeting-stable-updater.pubkey "$output/updater.pubkey"
+          else
+            cp keys/zergmeeting-preview-updater.pubkey "$output/updater.pubkey"
+          fi
+          APPLE_NOTARIZED="$([[ "$CHANNEL" == "stable" ]] && echo true || echo false)" \
+            OUTPUT_DIRECTORY="$output" \
+            node --input-type=module <<'NODE'
+          import { writeFile } from "node:fs/promises";
+
+          const metadata = {
+            schema_version: 1,
+            product: "Zerg Meeting",
+            version: process.env.VERSION,
+            channel: process.env.CHANNEL,
+            release_tag: process.env.RELEASE_TAG,
+            source_sha: process.env.SOURCE_SHA,
+            platform: "darwin-aarch64",
+            apple_notarized: process.env.APPLE_NOTARIZED === "true",
+          };
+          await writeFile(
+            process.env.OUTPUT_DIRECTORY + "/build-metadata.json",
+            JSON.stringify(metadata, null, 2) + "\n",
+          );
+          NODE
+          (
+            cd "$output"
+            shasum -a 256 \
+              "$(basename "$archive")" \
+              "$(basename "$dmg")" \
+              build-metadata.json \
+              updater.pubkey \
+              >SHA256SUMS
+          )
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zergmeeting-v2-macos-platform-signed
+          path: ${{ runner.temp }}/zergmeeting-apple-output/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  signed-smoke:
+    name: Audit and launch signed bytes on a fresh credential-free runner
+    needs:
+      - validate
+      - apple-sign
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CHANNEL: ${{ needs.validate.outputs.channel }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+          cache: npm
+
+      - name: Test the public signed-payload policy
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
+          npm test
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-macos-platform-signed
+          path: ${{ runner.temp }}/zergmeeting-signed-payload
+
+      - name: Audit and launch the signed Apple Silicon application
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/zergmeeting-signed-payload"
+          archive="$payload/ZergMeeting_${VERSION}_aarch64.app.tar.gz"
+          dmg="$payload/ZergMeeting_${VERSION}_aarch64.dmg"
+          (
+            cd "$payload"
+            shasum -a 256 -c SHA256SUMS
+          )
+          extraction="$RUNNER_TEMP/zergmeeting-signed-smoke"
+          ARCHIVE_PATH="$archive" EXTRACTION_PATH="$extraction" \
+            node --input-type=module <<'NODE'
+          import { extractSourceApplication } from "./scripts/package-macos.mjs";
+
+          await extractSourceApplication({
+            archivePath: process.env.ARCHIVE_PATH,
+            outputDirectory: process.env.EXTRACTION_PATH,
+            maxArchiveBytes: 1_073_741_824,
+            maxEntryCount: 16_384,
+            maxFileBytes: 536_870_912,
+            maxUncompressedBytes: 2_147_483_648,
+          });
+          NODE
+          app="$extraction/Zerg Meeting.app"
+          plist="$app/Contents/Info.plist"
+          executable="$app/Contents/MacOS/zergmeeting"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = \
+            "com.zergai.meeting"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = \
+            "$VERSION"
+          architectures="$(lipo -archs "$executable")"
+          test "$(wc -w <<<"$architectures" | tr -d ' ')" -eq 1
+          grep -qw arm64 <<<"$architectures"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --verify --strict --verbose=2 "$dmg"
+          hdiutil verify "$dmg" >/dev/null
+          signed_entitlements="$RUNNER_TEMP/zergmeeting-smoke-entitlements.plist"
+          signed_entitlements_json="$RUNNER_TEMP/zergmeeting-smoke-entitlements.json"
+          codesign -d --entitlements - --xml "$app" >"$signed_entitlements"
+          test -s "$signed_entitlements"
+          plutil -convert json -o "$signed_entitlements_json" "$signed_entitlements"
+          SIGNED_ENTITLEMENTS_JSON="$signed_entitlements_json" \
+            node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile } from "node:fs/promises";
+
+          const actual = JSON.parse(
+            await readFile(process.env.SIGNED_ENTITLEMENTS_JSON, "utf8"),
+          );
+          const expected = {
+            "com.apple.security.app-sandbox": false,
+            "com.apple.security.network.client": true,
+            "com.apple.security.device.audio-input": true,
+            "com.apple.security.cs.allow-jit": true,
+            "com.apple.security.cs.allow-unsigned-executable-memory": true,
+          };
+          assert.deepEqual(actual, expected);
+          NODE
+          if [[ "$CHANNEL" == "stable" ]]; then
+            xcrun stapler validate "$app"
+            xcrun stapler validate "$dmg"
+            spctl --assess --type execute --verbose=4 "$app"
+            gatekeeper_output="$(spctl --assess --type open --context context:primary-signature \
+              --verbose=4 "$dmg" 2>&1)"
+            grep -F "source=Notarized Developer ID" <<<"$gatekeeper_output"
+          fi
+
+          log="$RUNNER_TEMP/zergmeeting-signed-smoke.log"
+          "$executable" >"$log" 2>&1 &
+          app_pid=$!
+          cleanup() {
+            kill -TERM "$app_pid" 2>/dev/null || true
+            wait "$app_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sleep 8
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            cat "$log"
+            echo "::error::The signed ZergMeeting application exited during launch smoke."
+            exit 1
+          fi
+          cleanup
+          trap - EXIT
+
+  sign-updater-preview:
+    name: Sign finished preview updater archive
+    needs:
+      - validate
+      - signed-smoke
+    if: needs.validate.outputs.channel == 'preview'
+    runs-on: ubuntu-24.04
+    environment: zergmeeting-preview-updater
+    env:
+      CHANNEL: ${{ needs.validate.outputs.channel }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      REQUEST_PATH: ${{ needs.validate.outputs.request_path }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+          cache: npm
+
+      - name: Install only the pinned public updater signer
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-macos-platform-signed
+          path: release-input
+
+      - name: Revalidate provenance and the independent updater trust root
+        run: |
+          set -euo pipefail
+          (
+            cd release-input
+            sha256sum -c SHA256SUMS
+          )
+          rm -f release-input/SHA256SUMS
+          node scripts/release-request.mjs "$REQUEST_PATH"
+          public_key="keys/zergmeeting-preview-updater.pubkey"
+          cmp --silent "$public_key" release-input/updater.pubkey
+          test "$(find release-input -maxdepth 1 -type f -name '*.app.tar.gz' | wc -l)" -eq 1
+          test "$(find release-input -maxdepth 1 -type f -name '*.dmg' | wc -l)" -eq 1
+          test -s release-input/build-metadata.json
+
+      - name: Sign only the preview updater archive
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.ZERGMEETING_PREVIEW_TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.ZERGMEETING_PREVIEW_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]]; then
+            echo "::error::The environment-scoped preview updater signing identity is incomplete."
+            exit 1
+          fi
+          archive="release-input/ZergMeeting_${VERSION}_aarch64.app.tar.gz"
+          test -f "$archive" && test ! -L "$archive"
+          npm exec --offline -- tauri signer sign "$archive"
+          unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          test -s "${archive}.sig"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zergmeeting-v2-updater-preview
+          path: release-input/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-updater-stable:
+    name: Sign finished stable updater archive
+    needs:
+      - validate
+      - signed-smoke
+    if: needs.validate.outputs.channel == 'stable'
+    runs-on: ubuntu-24.04
+    environment: zergmeeting-stable-updater
+    env:
+      CHANNEL: ${{ needs.validate.outputs.channel }}
+      REQUEST_PATH: ${{ needs.validate.outputs.request_path }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+          cache: npm
+
+      - name: Install only the pinned public updater signer
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-macos-platform-signed
+          path: release-input
+
+      - name: Revalidate provenance and the independent updater trust root
+        run: |
+          set -euo pipefail
+          (
+            cd release-input
+            sha256sum -c SHA256SUMS
+          )
+          rm -f release-input/SHA256SUMS
+          node scripts/release-request.mjs "$REQUEST_PATH"
+          public_key="keys/zergmeeting-stable-updater.pubkey"
+          cmp --silent "$public_key" release-input/updater.pubkey
+          test "$(find release-input -maxdepth 1 -type f -name '*.app.tar.gz' | wc -l)" -eq 1
+          test "$(find release-input -maxdepth 1 -type f -name '*.dmg' | wc -l)" -eq 1
+          test -s release-input/build-metadata.json
+
+      - name: Sign only the stable updater archive
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.ZERGMEETING_STABLE_TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.ZERGMEETING_STABLE_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]]; then
+            echo "::error::The environment-scoped stable updater signing identity is incomplete."
+            exit 1
+          fi
+          archive="release-input/ZergMeeting_${VERSION}_aarch64.app.tar.gz"
+          test -f "$archive" && test ! -L "$archive"
+          npm exec --offline -- tauri signer sign "$archive"
+          unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          test -s "${archive}.sig"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zergmeeting-v2-updater-stable
+          path: release-input/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-updater:
+    name: Verify and collect the selected updater payload
+    needs:
+      - validate
+      - sign-updater-preview
+      - sign-updater-stable
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.validate.result == 'success' &&
+      ((needs.validate.outputs.channel == 'preview' &&
+        needs.sign-updater-preview.result == 'success' &&
+        needs.sign-updater-stable.result == 'skipped') ||
+       (needs.validate.outputs.channel == 'stable' &&
+        needs.sign-updater-stable.result == 'success' &&
+        needs.sign-updater-preview.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      CHANNEL: ${{ needs.validate.outputs.channel }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      REQUEST_PATH: ${{ needs.validate.outputs.request_path }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+          cache: npm
+
+      - name: Install and test only the public release tooling
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
+          npm test
+          verifier_archive="$RUNNER_TEMP/minisign-0.12-linux.tar.gz"
+          verifier_root="$RUNNER_TEMP/zergmeeting-release-tools"
+          mkdir -p "$verifier_root"
+          curl --fail --location --silent --show-error \
+            --proto '=https' --tlsv1.2 \
+            https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz \
+            --output "$verifier_archive"
+          echo \
+            "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73  $verifier_archive" \
+            | sha256sum -c -
+          tar -xzf "$verifier_archive" -C "$verifier_root"
+          verifier_binary="$(find "$verifier_root/minisign-linux" \
+            -mindepth 2 -maxdepth 2 -type f -name minisign -print -quit)"
+          test -n "$verifier_binary" && test -f "$verifier_binary" && test ! -L "$verifier_binary"
+          install -m 755 \
+            "$verifier_binary" \
+            "$verifier_root/minisign"
+          echo "$verifier_root" >>"$GITHUB_PATH"
+
+      - if: needs.validate.outputs.channel == 'preview'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-updater-preview
+          path: release-input
+
+      - if: needs.validate.outputs.channel == 'stable'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-updater-stable
+          path: release-input
+
+      - name: Revalidate the selected signed payload
+        run: |
+          set -euo pipefail
+          node scripts/release-request.mjs "$REQUEST_PATH"
+          if [[ "$CHANNEL" == "stable" ]]; then
+            public_key="keys/zergmeeting-stable-updater.pubkey"
+          else
+            public_key="keys/zergmeeting-preview-updater.pubkey"
+          fi
+          cmp --silent "$public_key" release-input/updater.pubkey
+          test "$(find release-input -maxdepth 1 -type f -name '*.app.tar.gz' | wc -l)" -eq 1
+          test "$(find release-input -maxdepth 1 -type f -name '*.app.tar.gz.sig' | wc -l)" -eq 1
+          test "$(find release-input -maxdepth 1 -type f -name '*.dmg' | wc -l)" -eq 1
+          test -s release-input/build-metadata.json
+
+      - name: Verify the updater signature with the public trust root
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="release-input/ZergMeeting_${VERSION}_aarch64.app.tar.gz"
+          test -f "$archive" && test ! -L "$archive"
+          signature="${archive}.sig"
+          if [[ "$CHANNEL" == "stable" ]]; then
+            public_key="keys/zergmeeting-stable-updater.pubkey"
+          else
+            public_key="keys/zergmeeting-preview-updater.pubkey"
+          fi
+          PUBLIC_KEY="$public_key" \
+            ARCHIVE_SIGNATURE="$signature" \
+            node - <<'NODE'
+          const fs = require("node:fs");
+          const publicKey = fs.readFileSync(process.env.PUBLIC_KEY, "utf8").trim();
+          const signature = fs.readFileSync(process.env.ARCHIVE_SIGNATURE, "utf8").trim();
+          fs.writeFileSync(process.env.RUNNER_TEMP + "/zergmeeting-updater.pub", Buffer.from(publicKey, "base64"));
+          fs.writeFileSync(process.env.RUNNER_TEMP + "/zergmeeting-updater.minisig", Buffer.from(signature, "base64"));
+          NODE
+          minisign -Vm "$archive" \
+            -p "$RUNNER_TEMP/zergmeeting-updater.pub" \
+            -x "$RUNNER_TEMP/zergmeeting-updater.minisig"
+
+      - name: Collect and verify the immutable release payload
+        run: |
+          set -euo pipefail
+          node scripts/collect-release.mjs "$REQUEST_PATH" release-input release
+          (
+            cd release
+            sha256sum -c checksums.txt
+          )
+          RELEASE_DIRECTORY="$PWD/release" node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile } from "node:fs/promises";
+
+          const directory = process.env.RELEASE_DIRECTORY;
+          const manifest = JSON.parse(await readFile(directory + "/latest.json", "utf8"));
+          const metadata = JSON.parse(
+            await readFile(directory + "/release-metadata.json", "utf8"),
+          );
+          assert.equal(manifest.version, process.env.VERSION);
+          assert.equal(metadata.version, process.env.VERSION);
+          assert.equal(metadata.channel, process.env.CHANNEL);
+          assert.equal(metadata.source_sha, process.env.SOURCE_SHA);
+          assert.equal(metadata.apple_notarized, process.env.CHANNEL === "stable");
+          const expectedPrefix =
+            "https://github.com/Epoch-ML/zergmeeting-releases/releases/download/" +
+            encodeURIComponent(process.env.RELEASE_TAG) +
+            "/";
+          assert.ok(
+            manifest.platforms["darwin-aarch64"].url.startsWith(expectedPrefix),
+            "updater URL must use the encoded immutable release tag",
+          );
+          assert.ok(
+            manifest.platforms["darwin-aarch64"].signature.length > 32,
+            "updater signature must be substantive",
+          );
+          assert.deepEqual(Object.keys(manifest.platforms), ["darwin-aarch64"]);
+          NODE
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zergmeeting-v2-macos
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish immutable release assets
+    needs:
+      - validate
+      - sign-updater
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      CHANNEL: ${{ needs.validate.outputs.channel }}
+      REQUEST_COMMIT: ${{ needs.validate.outputs.request_commit }}
+      REQUEST_PATH: ${{ needs.validate.outputs.request_path }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: release-repository
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-macos
+          path: release
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+          cache: npm
+          cache-dependency-path: release-repository/package-lock.json
+
+      - name: Revalidate repository policy and release payload
+        run: |
+          set -euo pipefail
+          git -C release-repository merge-base --is-ancestor \
+            "$REQUEST_COMMIT" \
+            HEAD
+          git -C release-repository show \
+            "${REQUEST_COMMIT}:${REQUEST_PATH}" \
+            >"$RUNNER_TEMP/zergmeeting-publish-request.json"
+          cmp --silent \
+            "release-repository/$REQUEST_PATH" \
+            "$RUNNER_TEMP/zergmeeting-publish-request.json"
+          if [[ "$CHANNEL" == "stable" ]]; then
+            updater_key_path="keys/zergmeeting-stable-updater.pubkey"
+          else
+            updater_key_path="keys/zergmeeting-preview-updater.pubkey"
+          fi
+          updater_key_type="$(git -C release-repository ls-tree \
+            "$REQUEST_COMMIT" -- "$updater_key_path" \
+            | awk '{ print $1 " " $2 }')"
+          if [[ "$updater_key_type" != "100644 blob" ]]; then
+            echo "::error::The request-bound updater key must be one normal file."
+            exit 1
+          fi
+          git -C release-repository show \
+            "${REQUEST_COMMIT}:${updater_key_path}" \
+            >"$RUNNER_TEMP/zergmeeting-request-updater.pubkey"
+          test -s "$RUNNER_TEMP/zergmeeting-request-updater.pubkey"
+          cd release-repository
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
+          npm test
+          cd ..
+          test -s release/latest.json
+          test -s release/release-metadata.json
+          test -s release/checksums.txt
+          (
+            cd release
+            sha256sum -c checksums.txt
+          )
+          node release-repository/scripts/verify-release-payload.mjs \
+            "release-repository/$REQUEST_PATH" \
+            "$PWD/release" \
+            "$GITHUB_REPOSITORY"
+
+      - name: Install the pinned public updater verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          verifier_archive="$RUNNER_TEMP/minisign-0.12-linux.tar.gz"
+          verifier_root="$RUNNER_TEMP/zergmeeting-public-release-tools"
+          mkdir -p "$verifier_root"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 30 --max-time 300 \
+            --max-filesize 10485760 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz \
+            --output "$verifier_archive"
+          echo \
+            "9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73  $verifier_archive" \
+            | sha256sum -c -
+          tar -xzf "$verifier_archive" -C "$verifier_root"
+          verifier_binary="$(find "$verifier_root/minisign-linux" \
+            -mindepth 2 -maxdepth 2 -type f -name minisign -print -quit)"
+          test -n "$verifier_binary" && test -f "$verifier_binary" && test ! -L "$verifier_binary"
+          install -m 755 \
+            "$verifier_binary" \
+            "$verifier_root/minisign"
+          echo "$verifier_root" >>"$GITHUB_PATH"
+
+      - name: Verify the tag and create or resume the immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes_file="$RUNNER_TEMP/zergmeeting-release-notes.md"
+          node release-repository/scripts/release-notes.mjs \
+            "$notes_file" \
+            "$VERSION" \
+            "$CHANNEL" \
+            "$SOURCE_SHA"
+          expected_prerelease=false
+          if [[ "$CHANNEL" == "preview" ]]; then
+            expected_prerelease=true
+          fi
+
+          git -C release-repository fetch --force --no-tags origin \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tag_target="$(git -C release-repository rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$tag_target" != "$REQUEST_COMMIT" ]]; then
+            echo "::error::Release tag resolves to $tag_target, not immutable request commit $REQUEST_COMMIT."
+            exit 1
+          fi
+
+          release_json="$RUNNER_TEMP/zergmeeting-release.json"
+          release_pages="$RUNNER_TEMP/zergmeeting-release-pages.json"
+          resolve_release() {
+            gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              >"$release_pages"
+            node release-repository/scripts/resolve-release.mjs \
+              "$release_pages" \
+              "$RELEASE_TAG" \
+              >"$release_json"
+          }
+          wait_for_created_release() {
+            for attempt in {1..12}; do
+              resolve_release
+              if jq -e '. != null' "$release_json" >/dev/null; then
+                if ! jq -e '.draft == true' "$release_json" >/dev/null; then
+                  echo "::error::The newly created release unexpectedly became published before asset verification."
+                  return 1
+                fi
+                return 0
+              fi
+              if [[ "$attempt" -lt 12 ]]; then
+                sleep 5
+              fi
+            done
+            echo "::error::The newly created draft release did not converge in the authenticated release listing."
+            return 1
+          }
+          resolve_release
+          if ! jq -e '. == null' "$release_json" >/dev/null; then
+            echo "Resuming verification of existing release $RELEASE_TAG."
+          else
+            create_args=(
+              "$RELEASE_TAG"
+              --repo "$GITHUB_REPOSITORY"
+              --verify-tag
+              --title "ZergMeeting $VERSION ($CHANNEL)"
+              --notes-file "$notes_file"
+              --draft
+            )
+            if [[ "$CHANNEL" == "preview" ]]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "${create_args[@]}"
+            wait_for_created_release
+          fi
+
+          release_id="$(jq -er \
+            '.id | select((type == "number") and (. > 0) and (floor == .))' \
+            "$release_json")"
+          refresh_release() {
+            gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              >"$release_json"
+            jq -e \
+              --arg tag "$RELEASE_TAG" \
+              --argjson expected_id "$release_id" \
+              '.id == $expected_id and .tag_name == $tag' \
+              "$release_json" >/dev/null
+          }
+
+          RELEASE_JSON="$release_json" \
+            EXPECTED_PRERELEASE="$expected_prerelease" \
+            NOTES_FILE="$notes_file" \
+            node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+
+          const release = JSON.parse(await readFile(process.env.RELEASE_JSON, "utf8"));
+          const expectedBody = await readFile(process.env.NOTES_FILE, "utf8");
+          const expectedPrerelease = process.env.EXPECTED_PRERELEASE === "true";
+          const mismatches = [];
+          if (release.tag_name !== process.env.RELEASE_TAG) mismatches.push("tag_name");
+          if (release.name !== "ZergMeeting " + process.env.VERSION + " (" + process.env.CHANNEL + ")") {
+            mismatches.push("name/channel");
+          }
+          if (release.prerelease !== expectedPrerelease) mismatches.push("prerelease");
+          if (release.body !== expectedBody) mismatches.push("body");
+          if (typeof release.draft !== "boolean") mismatches.push("draft");
+          if (mismatches.length !== 0) {
+            throw new Error(
+              "Existing release metadata does not match: " + mismatches.join(", "),
+            );
+          }
+          NODE
+
+          find release -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
+            | LC_ALL=C sort >"$RUNNER_TEMP/local-asset-names.txt"
+          jq -r '.assets[].name' "$release_json" \
+            | LC_ALL=C sort >"$RUNNER_TEMP/remote-asset-names.txt"
+          if comm -13 \
+            "$RUNNER_TEMP/local-asset-names.txt" \
+            "$RUNNER_TEMP/remote-asset-names.txt" \
+            | grep -q .; then
+            echo "::error::The existing release contains unexpected immutable assets."
+            comm -13 \
+              "$RUNNER_TEMP/local-asset-names.txt" \
+              "$RUNNER_TEMP/remote-asset-names.txt"
+            exit 1
+          fi
+
+          release_is_draft="$(jq -r '.draft | tostring' "$release_json")"
+          if [[ "$release_is_draft" == "true" ]]; then
+            for local_asset in release/*; do
+              asset_name="$(basename "$local_asset")"
+              asset_count="$(jq -r --arg name "$asset_name" \
+                '[.assets[] | select(.name == $name)] | length' \
+                "$release_json")"
+              if [[ "$asset_count" -gt 1 ]]; then
+                echo "::error::Draft release contains duplicate asset names: $asset_name"
+                exit 1
+              fi
+              if [[ "$asset_count" -eq 0 ]]; then
+                gh release upload "$RELEASE_TAG" "$local_asset" \
+                  --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+          elif ! jq -e '.immutable == true' "$release_json" >/dev/null; then
+            echo "::error::Published release must already be immutable before canonical recovery."
+            exit 1
+          fi
+
+          refresh_release
+          jq -r '.assets[].name' "$release_json" \
+            | LC_ALL=C sort >"$RUNNER_TEMP/remote-asset-names.txt"
+          diff --unified \
+            "$RUNNER_TEMP/local-asset-names.txt" \
+            "$RUNNER_TEMP/remote-asset-names.txt"
+
+          asset_size_limit() {
+            case "$1" in
+              checksums.txt|latest.json|release-metadata.json|*.sig)
+                echo 1048576
+                ;;
+              *.app.tar.gz|*.dmg)
+                echo 536870912
+                ;;
+              *)
+                echo "::error::Unknown release asset class: $1" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          total_api_bytes=0
+          for local_asset in release/*; do
+            asset_name="$(basename "$local_asset")"
+            asset_record="$(jq -cer --arg name "$asset_name" \
+              '[.assets[] | select(.name == $name)] | select(length == 1) | .[0]' \
+              "$release_json")"
+            jq -e --arg name "$asset_name" \
+              '.name == $name and .state == "uploaded"' \
+              <<<"$asset_record" >/dev/null
+            jq -er \
+              '.id | select((type == "number") and (. > 0) and (floor == .))' \
+              <<<"$asset_record" >/dev/null
+            asset_size="$(jq -er \
+              '.size | select((type == "number") and (. > 0) and (floor == .))' \
+              <<<"$asset_record")"
+            jq -er \
+              '.digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' \
+              <<<"$asset_record" >/dev/null
+            asset_url="$(jq -er \
+              '.browser_download_url | select(type == "string" and length > 0)' \
+              <<<"$asset_record")"
+            node release-repository/scripts/validate-release-asset-url.mjs \
+              "$asset_url" \
+              "$asset_name" \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_TAG" \
+              "$release_is_draft"
+            asset_limit="$(asset_size_limit "$asset_name")"
+            if [[ "$asset_size" -gt "$asset_limit" ]]; then
+              echo "::error::Release asset exceeds its size limit: $asset_name"
+              exit 1
+            fi
+            total_api_bytes=$((total_api_bytes + asset_size))
+            if [[ "$total_api_bytes" -gt 1073741824 ]]; then
+              echo "::error::Release assets exceed the total size limit."
+              exit 1
+            fi
+          done
+
+          authenticated_dir="$RUNNER_TEMP/zergmeeting-authenticated-assets"
+          mkdir -p "$authenticated_dir"
+          for local_asset in release/*; do
+            asset_name="$(basename "$local_asset")"
+            asset_record="$(jq -cer --arg name "$asset_name" \
+              '[.assets[] | select(.name == $name)] | select(length == 1) | .[0]' \
+              "$release_json")"
+            asset_id="$(jq -er \
+              '.id | select((type == "number") and (. > 0) and (floor == .))' \
+              <<<"$asset_record")"
+            asset_size="$(jq -er '.size' <<<"$asset_record")"
+            api_digest="$(jq -er '.digest' <<<"$asset_record")"
+            authenticated_asset="$authenticated_dir/$asset_name"
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              >"$authenticated_asset"
+            actual_size="$(wc -c <"$authenticated_asset" | tr -d '[:space:]')"
+            if [[ "$actual_size" != "$asset_size" ]]; then
+              echo "::error::Authenticated release asset size mismatch: $asset_name"
+              exit 1
+            fi
+            actual_digest="$(sha256sum "$authenticated_asset" | cut -d ' ' -f 1)"
+            if [[ "$api_digest" != "sha256:$actual_digest" ]]; then
+              echo "::error::Authenticated release asset digest mismatch: $asset_name"
+              exit 1
+            fi
+            if [[ "$release_is_draft" == "true" ]] \
+              && ! cmp --silent "$local_asset" "$authenticated_asset"; then
+              echo "::error::Existing draft release asset bytes do not match: $asset_name"
+              exit 1
+            fi
+          done
+
+          if [[ "$release_is_draft" == "true" ]]; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft=false
+          fi
+          refresh_release
+          test "$(jq -r '.draft | tostring' "$release_json")" = "false"
+          if ! jq -e '.immutable == true' "$release_json" >/dev/null; then
+            echo "::error::GitHub did not mark the published release immutable; refusing feed promotion."
+            exit 1
+          fi
+          git -C release-repository fetch --force --no-tags origin \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git -C release-repository rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "$REQUEST_COMMIT"
+
+      - name: Download and verify canonical public release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          authenticated_dir="$RUNNER_TEMP/zergmeeting-authenticated-assets"
+          canonical_dir="$RUNNER_TEMP/zergmeeting-public-assets"
+          release_json="$RUNNER_TEMP/zergmeeting-release.json"
+          mkdir -p "$canonical_dir"
+
+          asset_size_limit() {
+            case "$1" in
+              checksums.txt|latest.json|release-metadata.json|*.sig)
+                echo 1048576
+                ;;
+              *.app.tar.gz|*.dmg)
+                echo 536870912
+                ;;
+              *)
+                echo "::error::Unknown canonical release asset class: $1" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          total_public_bytes=0
+          for authenticated_asset in "$authenticated_dir"/*; do
+            asset_name="$(basename "$authenticated_asset")"
+            asset_record="$(jq -cer --arg name "$asset_name" \
+              '[.assets[] | select(.name == $name)] | select(length == 1) | .[0]' \
+              "$release_json")"
+            asset_size="$(jq -er \
+              '.size | select((type == "number") and (. > 0) and (floor == .))' \
+              <<<"$asset_record")"
+            jq -er \
+              '.browser_download_url | select(type == "string" and length > 0)' \
+              <<<"$asset_record" >/dev/null
+            asset_limit="$(asset_size_limit "$asset_name")"
+            if [[ "$asset_size" -gt "$asset_limit" ]]; then
+              echo "::error::Public release asset exceeds its size limit: $asset_name"
+              exit 1
+            fi
+            total_public_bytes=$((total_public_bytes + asset_size))
+            if [[ "$total_public_bytes" -gt 1073741824 ]]; then
+              echo "::error::Public release assets exceed the total size limit."
+              exit 1
+            fi
+          done
+
+          for authenticated_asset in "$authenticated_dir"/*; do
+            asset_name="$(basename "$authenticated_asset")"
+            asset_record="$(jq -cer --arg name "$asset_name" \
+              '[.assets[] | select(.name == $name)] | select(length == 1) | .[0]' \
+              "$release_json")"
+            asset_size="$(jq -er '.size' <<<"$asset_record")"
+            asset_url="$(jq -er '.browser_download_url' <<<"$asset_record")"
+            node release-repository/scripts/validate-release-asset-url.mjs \
+              "$asset_url" \
+              "$asset_name" \
+              "$GITHUB_REPOSITORY" \
+              "$RELEASE_TAG" \
+              "false"
+            public_asset="$canonical_dir/$asset_name"
+            curl --fail --location --silent --show-error \
+              --retry 8 --retry-all-errors \
+              --connect-timeout 30 --max-time 900 \
+              --max-filesize "$asset_size" --remove-on-error \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              "$asset_url" \
+              --output "$public_asset"
+            actual_size="$(wc -c <"$public_asset" | tr -d '[:space:]')"
+            if [[ "$actual_size" != "$asset_size" ]]; then
+              echo "::error::Public release asset size mismatch: $asset_name"
+              exit 1
+            fi
+            cmp --silent "$authenticated_asset" "$public_asset"
+          done
+
+          node release-repository/scripts/verify-release-payload.mjs \
+            "release-repository/$REQUEST_PATH" \
+            "$canonical_dir" \
+            "$GITHUB_REPOSITORY" \
+            "$PWD/release"
+
+          archive="$(find "$canonical_dir" -maxdepth 1 -type f \
+            -name '*.app.tar.gz' -print)"
+          signature="${archive}.sig"
+          public_key="$RUNNER_TEMP/zergmeeting-request-updater.pubkey"
+          PUBLIC_KEY="$public_key" \
+            ARCHIVE_SIGNATURE="$signature" \
+            node - <<'NODE'
+          const fs = require("node:fs");
+          const publicKey = fs.readFileSync(process.env.PUBLIC_KEY, "utf8").trim();
+          const signature = fs.readFileSync(process.env.ARCHIVE_SIGNATURE, "utf8").trim();
+          fs.writeFileSync(process.env.RUNNER_TEMP + "/zergmeeting-canonical.pub", Buffer.from(publicKey, "base64"));
+          fs.writeFileSync(process.env.RUNNER_TEMP + "/zergmeeting-canonical.minisig", Buffer.from(signature, "base64"));
+          NODE
+          minisign -Vm "$archive" \
+            -p "$RUNNER_TEMP/zergmeeting-canonical.pub" \
+            -x "$RUNNER_TEMP/zergmeeting-canonical.minisig"
+
+          ARCHIVE="$archive" \
+            ARCHIVE_OUTPUT="$RUNNER_TEMP/zergmeeting-canonical-app" \
+            node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { extractSourceApplication } from "./release-repository/scripts/package-macos.mjs";
+
+          const result = await extractSourceApplication({
+            archivePath: process.env.ARCHIVE,
+            outputDirectory: process.env.ARCHIVE_OUTPUT,
+            maxArchiveBytes: 536_870_912,
+            maxEntryCount: 16_384,
+            maxFileBytes: 536_870_912,
+            maxUncompressedBytes: 1_073_741_824,
+          });
+          assert.ok(result.entryCount > 1, "canonical archive must contain application entries");
+          assert.ok(result.uncompressedBytes > 0, "canonical archive must contain application bytes");
+          NODE
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zergmeeting-v2-canonical-release
+          path: ${{ runner.temp }}/zergmeeting-public-assets/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  promote-feed:
+    name: Promote the verified v2 feed on a fresh runner
+    needs:
+      - validate
+      - publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      pages_artifact_id: ${{ steps.pages-artifact.outputs.artifact-id }}
+    environment:
+      name: zergmeeting-feed
+    env:
+      CHANNEL: ${{ needs.validate.outputs.channel }}
+      REQUEST_COMMIT: ${{ needs.validate.outputs.request_commit }}
+      REQUEST_PATH: ${{ needs.validate.outputs.request_path }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: release-repository
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+          cache: npm
+          cache-dependency-path: release-repository/package-lock.json
+
+      - name: Install and test the read-only feed policy
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund \
+            --prefix release-repository
+          node --test release-repository/scripts/feed-policy.test.mjs
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-canonical-release
+          path: release
+
+      - name: Revalidate the immutable request, tag, and canonical signed feed inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C release-repository merge-base --is-ancestor \
+            "$REQUEST_COMMIT" \
+            HEAD
+          git -C release-repository show \
+            "${REQUEST_COMMIT}:${REQUEST_PATH}" \
+            >"$RUNNER_TEMP/zergmeeting-feed-request.json"
+          cmp --silent \
+            "release-repository/$REQUEST_PATH" \
+            "$RUNNER_TEMP/zergmeeting-feed-request.json"
+          node release-repository/scripts/release-request.mjs \
+            "release-repository/$REQUEST_PATH" \
+            >/dev/null
+          test -s release/latest.json
+          test -s release/release-metadata.json
+          test -s release/checksums.txt
+          (
+            cd release
+            sha256sum -c checksums.txt
+          )
+          node release-repository/scripts/verify-release-payload.mjs \
+            "release-repository/$REQUEST_PATH" \
+            "$PWD/release" \
+            "$GITHUB_REPOSITORY"
+          git -C release-repository fetch --force --no-tags origin \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tag_target="$(git -C release-repository rev-parse \
+            "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$tag_target" != "$REQUEST_COMMIT" ]]; then
+            echo "::error::Release tag moved before feed promotion."
+            exit 1
+          fi
+
+      - id: feed
+        name: Stage and commit only the channel-scoped Pages feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e pages
+          GIT_CONFIG_NOSYSTEM=1 \
+            git -c core.hooksPath=/dev/null clone \
+              --filter=blob:none \
+              --single-branch \
+              --branch release-data \
+              "https://github.com/$GITHUB_REPOSITORY.git" \
+              pages
+          git -C pages config core.hooksPath /dev/null
+          prepared_parent="$(git -C pages rev-parse HEAD)"
+          node release-repository/scripts/feed-policy.mjs \
+            "$CHANNEL" \
+            "$VERSION" \
+            "$PWD/release" \
+            "$PWD/pages"
+
+          while IFS= read -r status_line; do
+            changed_path="${status_line:3}"
+            case "$changed_path" in
+              "$CHANNEL/latest.json"|"$CHANNEL/releases/$VERSION.json") ;;
+              *)
+                echo "::error::Unexpected release-data change: $changed_path"
+                exit 1
+                ;;
+            esac
+          done < <(git -C pages status --porcelain --untracked-files=all)
+          git -C pages config user.name "github-actions[bot]"
+          git -C pages config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C pages add -- "$CHANNEL/latest.json" "$CHANNEL/releases/$VERSION.json"
+          has_commit=false
+          if ! git -C pages diff --cached --quiet; then
+            git -C pages commit -m "Publish ZergMeeting $VERSION $CHANNEL feed"
+            has_commit=true
+          fi
+          echo "has_commit=$has_commit" >>"$GITHUB_OUTPUT"
+          echo "prepared_parent=$prepared_parent" >>"$GITHUB_OUTPUT"
+
+      - name: Push the prepared release-data commit
+        if: steps.feed.outputs.has_commit == 'true'
+        env:
+          ZERGMEETING_FEED_DEPLOY_KEY: ${{ secrets.ZERGMEETING_FEED_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$ZERGMEETING_FEED_DEPLOY_KEY"
+          data_repo="$GITHUB_WORKSPACE/pages"
+          key_path="$RUNNER_TEMP/zergmeeting-feed-deploy-key"
+          known_hosts="$RUNNER_TEMP/zergmeeting-feed-known-hosts"
+          meta_keys="$RUNNER_TEMP/zergmeeting-feed-meta-keys"
+          scanned_keys="$RUNNER_TEMP/zergmeeting-feed-scanned-keys"
+          trap 'rm -f "$key_path"' EXIT
+          install -m 600 /dev/null "$key_path"
+          printf '%s\n' "$ZERGMEETING_FEED_DEPLOY_KEY" >"$key_path"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            https://api.github.com/meta \
+            | jq -er '.ssh_keys[]' >"$meta_keys"
+          ssh-keyscan -T 10 -t rsa,ecdsa,ed25519 github.com 2>/dev/null >"$scanned_keys"
+          : >"$known_hosts"
+          while read -r host algorithm key extra; do
+            if [[ -z "$host" || "${host:0:1}" == "#" ]]; then continue; fi
+            if [[ "$host" != "github.com" || -z "$algorithm" || -z "$key" || -n "${extra:-}" ]]; then
+              echo "::error::ssh-keyscan returned a malformed host-key line."
+              exit 1
+            fi
+            grep -Fqx "$algorithm $key" "$meta_keys" || {
+              echo "::error::ssh-keyscan returned a key absent from authenticated metadata."
+              exit 1
+            }
+            printf 'github.com %s %s\n' "$algorithm" "$key" >>"$known_hosts"
+          done <"$scanned_keys"
+          test -s "$known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+          remote_head="$(git ls-remote \
+            "git@github.com:${GITHUB_REPOSITORY}.git" \
+            refs/heads/release-data | cut -f1)"
+          if [[ "$remote_head" != "${{ steps.feed.outputs.prepared_parent }}" ]]; then
+            echo "::error::release-data advanced after feed preparation."
+            exit 1
+          fi
+          git -C "$data_repo" push \
+            "git@github.com:${GITHUB_REPOSITORY}.git" \
+            HEAD:refs/heads/release-data
+          unset ZERGMEETING_FEED_DEPLOY_KEY
+          rm -f "$key_path"
+
+      - name: Build the deterministic Pages artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find pages \
+            -path pages/.git -prune -o \
+            -path pages/.github -prune -o \
+            -type l -print -quit | grep -q .; then
+            echo "::error::The Pages tree contains a symbolic link."
+            exit 1
+          fi
+          if find pages \
+            -path pages/.git -prune -o \
+            -path pages/.github -prune -o \
+            ! -type d ! -type f -print -quit | grep -q .; then
+            echo "::error::The Pages tree contains a special filesystem entry."
+            exit 1
+          fi
+
+          tar \
+            --create \
+            --file="$RUNNER_TEMP/artifact.tar" \
+            --directory=pages \
+            --dereference \
+            --hard-dereference \
+            --exclude=.git \
+            --exclude=.github \
+            --sort=name \
+            --mtime='UTC 2020-01-01' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --mode='u+rwX,go+rX,go-w' \
+            .
+          test -s "$RUNNER_TEMP/artifact.tar"
+          if tar --list --file="$RUNNER_TEMP/artifact.tar" \
+            | sed 's#^\./##' \
+            | grep -Eq '(^|/)\.git(hub)?(/|$)'; then
+            echo "::error::The Pages archive must not contain git metadata."
+            exit 1
+          fi
+
+      - id: pages-artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+
+  deploy-pages:
+    name: Deploy and verify the v2 updater feed
+    needs:
+      - validate
+      - promote-feed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22.23.2"
+
+      - id: deployment
+        name: Deploy Pages without cancelling a recoverable queue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PAGES_ARTIFACT_ID: ${{ needs.promote-feed.outputs.pages_artifact_id }}
+          PAGES_DEPLOY_TIMEOUT_MS: "1800000"
+        run: node scripts/deploy-pages.mjs
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zergmeeting-v2-canonical-release
+          path: release
+
+      - name: Verify the published channel manifest over HTTPS
+        env:
+          CHANNEL: ${{ needs.validate.outputs.channel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          public_manifest="https://epoch-ml.github.io/zergmeeting-releases/$CHANNEL/latest.json"
+          for attempt in {1..18}; do
+            if curl --fail --location --silent --show-error \
+              --proto '=https' --tlsv1.2 \
+              "${public_manifest}?run=$GITHUB_RUN_ID-$attempt" \
+              --output "$RUNNER_TEMP/zergmeeting-published-latest.json" \
+              && cmp --silent release/latest.json "$RUNNER_TEMP/zergmeeting-published-latest.json"; then
+              echo "Verified $public_manifest"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::The published channel manifest did not converge to the verified bytes."
+          exit 1
