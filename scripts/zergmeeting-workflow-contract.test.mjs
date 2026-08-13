@@ -52,6 +52,10 @@ describe("ZergMeeting source-build release contract", () => {
       install.run,
       /^\s*npm ci --prefix source\/ztc\s*$/m,
     );
+    assert.match(
+      install.run,
+      /^\s*npm ci --ignore-scripts --no-audit --no-fund --prefix source\/zapps\/zergmeeting\/scripts\/release\s*$/m,
+    );
     assert.doesNotMatch(
       install.run,
       /npm ci[^\n]*--omit(?:=|\s+)optional/,
@@ -61,7 +65,8 @@ describe("ZergMeeting source-build release contract", () => {
     const sourceGate = requireStep(build, "Test and audit the exact source");
     assert.equal(sourceGate["working-directory"], undefined);
     const orderedNativeGate = [
-      "npm audit --omit=dev --audit-level=moderate --prefix source/zapps/zergmeeting",
+      "npm run audit:web-production --prefix source/zapps/zergmeeting",
+      "npm --prefix source/ztc audit --omit=dev --audit-level=moderate",
       "npm run test:release --prefix source/zapps/zergmeeting",
       "npm run test:meeting-runtime --prefix source/zapps/zergmeeting",
     ];
@@ -74,8 +79,9 @@ describe("ZergMeeting source-build release contract", () => {
       return sourceGate.run.indexOf(command);
     });
     assert.ok(
-      gateIndexes[0] < gateIndexes[1] && gateIndexes[1] < gateIndexes[2],
-      "the production audit must precede release and application tests",
+      gateIndexes[0] < gateIndexes[1] && gateIndexes[1] < gateIndexes[2] &&
+        gateIndexes[2] < gateIndexes[3],
+      "the bounded web and zero-vulnerability source audits must precede tests",
     );
     for (const command of [
       "npm run typecheck --prefix source/zapps/zergmeeting",

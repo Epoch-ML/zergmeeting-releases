@@ -86,6 +86,27 @@ test("builds exact local ZTC inputs before staging a symlink-free runtime", () =
   assert.match(stage.run, /find "\$stage" -type l/);
 });
 
+test("uses the reviewed web baseline while keeping the packed source audit clean", () => {
+  const install = step("build-macos", "Install locked dependencies and security tooling");
+  assert.match(
+    install.run,
+    /npm ci --ignore-scripts --no-audit --no-fund --prefix source\/zapps\/zergmeeting\/scripts\/release/,
+  );
+  const gate = step("build-macos", "Test and audit the exact source");
+  assert.match(
+    gate.run,
+    /npm run audit:web-production --prefix source\/zapps\/zergmeeting/,
+  );
+  assert.match(
+    gate.run,
+    /npm --prefix source\/ztc audit --omit=dev --audit-level=moderate/,
+  );
+  assert.doesNotMatch(
+    gate.run,
+    /npm audit --omit=dev --audit-level=moderate --prefix source\/zapps\/zergmeeting/,
+  );
+});
+
 test("compiles the selected updater channel and verifies installed sidecar names", () => {
   const build = step(
     "build-macos",
