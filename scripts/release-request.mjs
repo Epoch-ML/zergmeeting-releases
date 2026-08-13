@@ -93,13 +93,14 @@ export function validateReleaseRequest(request, { requestFilename } = {}) {
   if (request.source_ref !== expectedRef) {
     throw new ReleaseRequestError(`source ref must be ${expectedRef}`);
   }
+  if (typeof request.requested_at !== "string") {
+    throw new ReleaseRequestError("request timestamp must be canonical ISO-8601");
+  }
   let canonicalTimestamp = null;
-  if (typeof request.requested_at === "string") {
-    try {
-      canonicalTimestamp = new Date(request.requested_at).toISOString();
-    } catch {
-      canonicalTimestamp = null;
-    }
+  try {
+    canonicalTimestamp = new Date(request.requested_at).toISOString();
+  } catch {
+    canonicalTimestamp = null;
   }
   if (canonicalTimestamp !== request.requested_at) {
     throw new ReleaseRequestError(
