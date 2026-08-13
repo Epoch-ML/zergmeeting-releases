@@ -64,6 +64,9 @@ describe("ZergMeeting source-build release contract", () => {
 
     const sourceGate = requireStep(build, "Test and audit the exact source");
     assert.equal(sourceGate["working-directory"], undefined);
+    assert.deepEqual(sourceGate.env, {
+      TAURI_CONFIG: '{"bundle":{"externalBin":[],"resources":[]}}',
+    });
     const orderedNativeGate = [
       "npm run audit:web-production --prefix source/zapps/zergmeeting",
       "npm --prefix source/ztc audit --omit=dev --audit-level=moderate",
