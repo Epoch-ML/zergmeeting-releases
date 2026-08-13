@@ -19,7 +19,8 @@ artifacts, independent channel updater public keys, and GitHub Pages feeds.
    workflow is manually dispatched from **main** with the request path. It
    requires the remote tag to exist and peel to the request commit before it
    enters a build environment, then checks out the exact private source SHA and
-   matching source tag and compares both channel updater keys byte for byte
+   matching source tag and compares both channel updater keys as canonical
+   trimmed base64 text
    with the independent roots under [keys](keys/).
 3. Source tests and audits run before any signing credentials are exposed. The
    source Tauri configuration, meeting usage descriptions, pinned Node runtime,
@@ -133,9 +134,11 @@ Preview and stable applications embed distinct updater roots:
 The stable feed can therefore never accept an archive signed by the preview
 identity, even if an ad-hoc preview app is otherwise valid.
 
-The private source repository has no desktop-release environment, public
-repository deploy key, or repository-wide release secret. Its tag workflow
-only uploads the deterministic request artifact for human review.
+The private source repository has no credential-bearing desktop-release
+environment, public repository deploy key, or repository-wide release secret.
+Its secret-free **zergmeeting-release-request** environment accepts only
+protected **zergmeeting-v\*** and **zergmeeting-preview-v\*** tags. Its tag
+workflow only uploads the deterministic request artifact for human review.
 
 Both channel build and updater environments, plus the stable Apple environment,
 require a human reviewer. Keep these controls enabled:
