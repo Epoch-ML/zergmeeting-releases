@@ -12,7 +12,8 @@ artifacts, independent channel updater public keys, and GitHub Pages feeds.
 1. A protected **zergmeeting-v\*** or **zergmeeting-preview-v\*** source tag emits one
    deterministic JSON request artifact. Its timestamp is the canonical UTC
    rendering of the source commit timestamp. The source workflow has no public
-   checkout, environment, secret, or cross-repository write authority.
+   checkout, credential, or cross-repository write authority; its only
+   environment is the secret-free **zergmeeting-release-request** boundary.
 2. A human submits and merges a pull request that adds only
    **requests/&lt;tag&gt;.json** as a single-parent commit, then creates the
    protected public tag at that exact request-addition commit. The public
