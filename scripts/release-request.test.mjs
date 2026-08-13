@@ -213,6 +213,8 @@ describe("ZergMeeting release request validation", () => {
       [makeRequest({ channel: "nightly" }), /channel must be preview or stable/],
       [makeRequest({ source_ref: "refs/heads/main" }), /source ref must be refs\/tags\/zergmeeting-preview-v0.1.9-preview.1/],
       [makeRequest({ requested_at: "not-a-date" }), /timestamp must be canonical ISO-8601/],
+      [makeRequest({ requested_at: null }), /timestamp must be canonical ISO-8601/],
+      [makeRequest({ requested_at: 1 }), /timestamp must be canonical ISO-8601/],
       [makeRequest({ requested_at: "2026-08-05T20:00:00Z" }), /timestamp must be canonical ISO-8601/],
       [makeRequest({ requested_at: "2026-08-05 20:00:00Z" }), /timestamp must be canonical ISO-8601/],
       [
