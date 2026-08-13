@@ -1643,14 +1643,21 @@ test("the collector normalizes settings through one injected HTTP boundary", asy
     ["Epoch-ML/zerg:actions/workflows", { workflows: [{
       path: ".github/workflows/zergmeeting-desktop-release.yml", state: "active",
     }] }],
-    ["Epoch-ML/zerg:environments", { environments: [{
-      name: "zergmeeting-release-request",
-      protection_rules: [{ type: "branch_policy" }],
-      deployment_branch_policy: {
-        protected_branches: false,
-        custom_branch_policies: true,
+    ["Epoch-ML/zerg:environments", { environments: [
+      {
+        name: "zergmeeting-release-request",
+        protection_rules: [{ type: "branch_policy" }],
+        deployment_branch_policy: {
+          protected_branches: false,
+          custom_branch_policies: true,
+        },
       },
-    }] }],
+      {
+        name: "zerg-sso-client-rc",
+        protection_rules: [],
+        deployment_branch_policy: null,
+      },
+    ] }],
     ["Epoch-ML/zerg:environments/zergmeeting-release-request/secrets", {
       secrets: [],
     }],
