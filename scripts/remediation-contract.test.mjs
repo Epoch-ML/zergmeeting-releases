@@ -69,7 +69,7 @@ test("builds exact local ZTC inputs before staging a symlink-free runtime", () =
     ZERGMEETING_ZTC_CAPTURE_BIN:
       "${{ runner.temp }}/zergmeeting-capture-target/aarch64-apple-darwin/release/ztc-capture",
     ZERGMEETING_ZTC_PACKAGE:
-      "${{ runner.temp }}/zergmeeting-ztc-package/zerg-ztc-0.2.0-beta.1.tgz",
+      "${{ runner.temp }}/zergmeeting-ztc-package/zerg-ztc-source.tgz",
   });
   for (const token of [
     "cargo build --locked --release --target aarch64-apple-darwin",
