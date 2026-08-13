@@ -6,10 +6,13 @@ import { pathToFileURL } from "node:url";
 import { auditWorkflowPolicy } from "./workflow-policy.mjs";
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
-const MAX_CHANGED_PATHS = 256;
 const MAX_DIFF_BYTES = 262_144;
 const MAX_WORKFLOW_BYTES = 262_144;
 const CANDIDATE_WORKFLOW_PATH = ".github/workflows/release.yml";
+const ROUTINE_PROTECTED_INPUT_PATHS = new Set([
+  "package.json",
+  "package-lock.json",
+]);
 
 export class AnchoredPolicyError extends Error {
   constructor(message) {
@@ -27,28 +30,32 @@ function diagnostic(code, message) {
 }
 
 function validChangedPaths(paths) {
-  if (
-    !Array.isArray(paths) ||
-    paths.length > MAX_CHANGED_PATHS ||
-    paths.some((path) =>
+  if (!Array.isArray(paths)) return false;
+  let serializedBytes = 0;
+  const uniquePaths = new Set();
+  for (const path of paths) {
+    if (
       typeof path !== "string" || path.length === 0 || path.length > 512 ||
       path.includes("\0") || path.startsWith("/") ||
-      path.split("/").includes("..")
-    )
-  ) {
-    return false;
+      path.split("/").includes("..") || uniquePaths.has(path)
+    ) return false;
+    serializedBytes += Buffer.byteLength(path) + 1;
+    if (serializedBytes > MAX_DIFF_BYTES) return false;
+    uniquePaths.add(path);
   }
-  return new Set(paths).size === paths.length;
+  return true;
 }
 
 function isProtectedPolicyPath(path) {
   if (path === CANDIDATE_WORKFLOW_PATH) return false;
-  return path === "package.json" ||
-    path === "package-lock.json" ||
-    path.startsWith("scripts/") ||
+  return path.startsWith("scripts/") ||
     path.startsWith("keys/") ||
     path.startsWith("macos/") ||
     path.startsWith(".github/");
+}
+
+function isRoutineProtectedInputPath(path) {
+  return ROUTINE_PROTECTED_INPUT_PATHS.has(path);
 }
 
 export function auditAnchoredPullRequestData(input) {
@@ -56,6 +63,12 @@ export function auditAnchoredPullRequestData(input) {
     throw new AnchoredPolicyError("anchored pull request data must be an object");
   }
   const diagnostics = [];
+  if (typeof input.routineProtectedChangeApproved !== "boolean") {
+    diagnostics.push(diagnostic(
+      "approval-boundary",
+      "routine protected-input review must be an explicit boolean",
+    ));
+  }
   if (!SHA_PATTERN.test(input.baseSha) || !SHA_PATTERN.test(input.headSha)) {
     diagnostics.push(diagnostic(
       "immutable-sha-boundary",
@@ -71,6 +84,14 @@ export function auditAnchoredPullRequestData(input) {
     diagnostics.push(diagnostic(
       "protected-policy-change",
       "protected-base policy code requires a separately audited bootstrap",
+    ));
+  } else if (
+    input.changedPaths.some(isRoutineProtectedInputPath) &&
+    input.routineProtectedChangeApproved !== true
+  ) {
+    diagnostics.push(diagnostic(
+      "protected-input-review",
+      "routine protected inputs require a head-bound independent review",
     ));
   }
   if (
@@ -113,13 +134,18 @@ async function readBounded(path, maximum, description) {
 }
 
 async function main() {
-  if (process.argv.length !== 8) {
+  if (process.argv.length !== 9) {
     throw new AnchoredPolicyError(
-      "usage: anchored-policy.mjs BASE_SHA HEAD_SHA DIFF_Z MODE SIZE CANDIDATE.yml",
+      "usage: anchored-policy.mjs BASE_SHA HEAD_SHA DIFF_Z MODE SIZE CANDIDATE.yml ROUTINE_REVIEWED",
     );
   }
   const [, , baseSha, headSha, diffPath, candidateMode, candidateSizeText,
-    candidatePath] = process.argv;
+    candidatePath, routineReviewedText] = process.argv;
+  if (routineReviewedText !== "true" && routineReviewedText !== "false") {
+    throw new AnchoredPolicyError(
+      "routine protected-input review must be true or false",
+    );
+  }
   const diff = await readBounded(diffPath, MAX_DIFF_BYTES, "candidate diff");
   if (diff.length > 0 && diff[diff.length - 1] !== 0) {
     throw new AnchoredPolicyError("candidate diff must be NUL terminated");
@@ -139,6 +165,7 @@ async function main() {
     candidateMode,
     candidateSize: Number(candidateSizeText),
     candidateWorkflow: candidate.toString("utf8"),
+    routineProtectedChangeApproved: routineReviewedText === "true",
   });
   process.stdout.write(`${JSON.stringify({ diagnostics }, null, 2)}\n`);
   if (diagnostics.length > 0) process.exitCode = 1;

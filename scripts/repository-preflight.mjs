@@ -81,6 +81,8 @@ const RELEASE_STATUS_RULE =
   "required_status_checks:strict:on-create:Protected-base release policy:15368";
 const SOURCE_ZERGLANG_STATUS_RULE =
   "required_status_checks:strict:on-create:Protected-base ZergLang release policy:15368";
+const SOURCE_DJZERG_STATUS_RULE =
+  "required_status_checks:strict:on-create:Protected-base DJZerg release policy:15368";
 const SOURCE_ZERGMEETING_STATUS_RULE =
   "required_status_checks:strict:on-create:Protected-base ZergMeeting release policy:15368";
 
@@ -252,6 +254,7 @@ const EXPECTED_SOURCE_RULESETS = Object.freeze([
       REVIEWED_PULL_REQUEST_RULE,
       "required_linear_history",
       SOURCE_ZERGLANG_STATUS_RULE,
+      SOURCE_DJZERG_STATUS_RULE,
       SOURCE_ZERGMEETING_STATUS_RULE,
     ]),
   }),

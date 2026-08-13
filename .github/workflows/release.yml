@@ -253,8 +253,8 @@ jobs:
           const config = JSON.parse(
             await readFile(process.env.TAURI_CONFIG, "utf8"),
           );
-          assert.equal(config.build.beforeBuildCommand, "npm run release:stage");
-          assert.equal(config.bundle.macOS.entitlements, "Entitlements.plist");
+          assert.equal(config.productName, "Zerg Meeting");
+          assert.equal(config.identifier, "com.zergai.meeting");
           assert.equal(config.bundle.macOS.infoPlist, "Info.plist");
           NODE
           for key in \
@@ -269,12 +269,22 @@ jobs:
       - name: Compare both tag-selected updater keys with independent trust roots
         run: |
           set -euo pipefail
-          cmp --silent \
-            release-repository/keys/zergmeeting-preview-updater.pubkey \
-            source/zapps/zergmeeting/src-tauri/updater-preview.pubkey
-          cmp --silent \
-            release-repository/keys/zergmeeting-stable-updater.pubkey \
-            source/zapps/zergmeeting/src-tauri/updater-stable.pubkey
+          node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile } from "node:fs/promises";
+
+          const roots = [
+            ["preview", "release-repository/keys/zergmeeting-preview-updater.pubkey", "source/zapps/zergmeeting/src-tauri/updater.preview.pubkey"],
+            ["stable", "release-repository/keys/zergmeeting-stable-updater.pubkey", "source/zapps/zergmeeting/src-tauri/updater.stable.pubkey"],
+          ];
+          for (const [channel, trustedPath, sourcePath] of roots) {
+            const trusted = (await readFile(trustedPath, "utf8")).trim();
+            const source = (await readFile(sourcePath, "utf8")).trim();
+            assert.match(trusted, /^[A-Za-z0-9+/]+={0,2}$/, "trusted root must be canonical base64");
+            assert.equal(Buffer.from(trusted, "base64").toString("base64"), trusted, "trusted root must be canonical base64");
+            assert.equal(source, trusted, `${channel} source updater root mismatch`);
+          }
+          NODE
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -310,6 +320,7 @@ jobs:
         run: |
           set -euo pipefail
           npm ci --prefix source/zapps/zergmeeting
+          npm ci --prefix source/ztc
           npm ci --ignore-scripts --prefix release-repository
           (
             cd release-repository
@@ -335,7 +346,8 @@ jobs:
         env:
           ZERGMEETING_NODE_ARCHIVE: ${{ runner.temp }}/node-v22.23.2-darwin-arm64.tar.gz
           ZERGMEETING_NODE_SHA256: 61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6
-        working-directory: source/zapps/zergmeeting
+          ZERGMEETING_ZTC_CAPTURE_BIN: ${{ runner.temp }}/zergmeeting-capture-target/aarch64-apple-darwin/release/ztc-capture
+          ZERGMEETING_ZTC_PACKAGE: ${{ runner.temp }}/zergmeeting-ztc-package/zerg-ztc-source.tgz
         shell: bash
         run: |
           set -euo pipefail
@@ -347,11 +359,60 @@ jobs:
             "$ZERGMEETING_NODE_SHA256" \
             "$ZERGMEETING_NODE_ARCHIVE" \
             | shasum -a 256 -c -
-          npm run release:stage
-          stage="dist/release-stage"
+
+          cargo build --locked --release --target aarch64-apple-darwin \
+            --manifest-path source/ztc/packages/ztc-capture/Cargo.toml \
+            --target-dir "$RUNNER_TEMP/zergmeeting-capture-target"
+          test -f "$ZERGMEETING_ZTC_CAPTURE_BIN" \
+            && test ! -L "$ZERGMEETING_ZTC_CAPTURE_BIN" \
+            && test -x "$ZERGMEETING_ZTC_CAPTURE_BIN"
+
+          npm run build --prefix source/ztc
+          pack_directory="$RUNNER_TEMP/zergmeeting-ztc-package"
+          pack_result="$RUNNER_TEMP/zergmeeting-ztc-pack.json"
+          mkdir -p "$pack_directory"
+          npm pack --prefix source/ztc --json \
+            --pack-destination "$pack_directory" >"$pack_result"
+          PACK_RESULT="$pack_result" PACK_DIRECTORY="$pack_directory" \
+            ZERGMEETING_ZTC_PACKAGE="$ZERGMEETING_ZTC_PACKAGE" \
+            node --input-type=module <<'NODE'
+          import assert from "node:assert/strict";
+          import { copyFile, lstat, readFile } from "node:fs/promises";
+          import { basename, resolve } from "node:path";
+
+          const records = JSON.parse(await readFile(process.env.PACK_RESULT, "utf8"));
+          assert.equal(records.length, 1, "npm pack must produce one source tarball");
+          const filename = records[0]?.filename;
+          assert.equal(filename, basename(filename), "npm pack filename must be bounded");
+          assert.match(filename, /^zerg-ztc-[0-9A-Za-z.+-]+\.tgz$/);
+          const packed = resolve(process.env.PACK_DIRECTORY, filename);
+          const metadata = await lstat(packed);
+          assert.equal(metadata.isFile(), true, "packed zerg-ztc must be a regular file");
+          assert.equal(metadata.isSymbolicLink(), false, "packed zerg-ztc must not be a symlink");
+          await copyFile(packed, process.env.ZERGMEETING_ZTC_PACKAGE);
+          NODE
+
+          (
+            cd source/zapps/zergmeeting
+            npm run release:stage
+          )
+          stage="source/zapps/zergmeeting/src-tauri/resources/desktop-runtime"
           test -d "$stage" && test ! -L "$stage"
+          for path in \
+            "$stage/meeting-bridge.mjs" \
+            "$stage/dist/runtime" \
+            "$stage/dist/modes" \
+            "$stage/node_modules/zerg-ztc/dist/cli_main.js"; do
+            test -e "$path" && test ! -L "$path"
+          done
+          test ! -e "$stage/node_modules/.bin"
           if find "$stage" -type l -print -quit | grep -q .; then
             echo "::error::Standalone meeting runtime contains a symbolic link."
+            exit 1
+          fi
+          if find source/zapps/zergmeeting/src-tauri/binaries -type l -print -quit \
+            | grep -q .; then
+            echo "::error::Standalone meeting binaries contain a symbolic link."
             exit 1
           fi
 
@@ -364,10 +425,10 @@ jobs:
           set -euo pipefail
           npm run release:config
           if [[ "$ZERGMEETING_UPDATE_CHANNEL" == "stable" ]]; then
-            key_name="updater-stable.pubkey"
+            key_name="updater.stable.pubkey"
             trust_name="zergmeeting-stable-updater.pubkey"
           else
-            key_name="updater-preview.pubkey"
+            key_name="updater.preview.pubkey"
             trust_name="zergmeeting-preview-updater.pubkey"
           fi
           RELEASE_COMMITTED_KEY="$key_name" \
@@ -377,23 +438,28 @@ jobs:
           import { readFile } from "node:fs/promises";
 
           const config = JSON.parse(await readFile("src-tauri/tauri.release.conf.json", "utf8"));
-          const committedKey = await readFile("src-tauri/" + process.env.RELEASE_COMMITTED_KEY);
-          const trustedKey = await readFile(process.env.RELEASE_TRUST_ROOT);
-          assert.equal(Buffer.compare(committedKey, trustedKey), 0);
+          const committedKey = await readFile(
+            "src-tauri/" + process.env.RELEASE_COMMITTED_KEY,
+            "utf8",
+          );
+          const trustedKey = await readFile(
+            process.env.RELEASE_TRUST_ROOT,
+            "utf8",
+          );
+          assert.equal(committedKey.trim(), trustedKey.trim());
           assert.equal(config.productName, "Zerg Meeting");
           assert.equal(config.identifier, "com.zergai.meeting");
           assert.equal(config.version, process.env.ZERGMEETING_VERSION);
           assert.deepEqual(config.plugins.updater.endpoints, [
             "https://epoch-ml.github.io/zergmeeting-releases/" + process.env.ZERGMEETING_UPDATE_CHANNEL + "/latest.json",
           ]);
-          assert.equal(config.plugins.updater.pubkey, committedKey.toString("utf8").trim());
+          assert.equal(config.plugins.updater.pubkey, committedKey.trim());
           assert.equal(config.bundle.createUpdaterArtifacts, false);
           NODE
 
       - name: Build the unsigned app without release signing credentials
         env:
-          ZERGMEETING_NODE_ARCHIVE: ${{ runner.temp }}/node-v22.23.2-darwin-arm64.tar.gz
-          ZERGMEETING_NODE_SHA256: 61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6
+          ZERGMEETING_UPDATE_CHANNEL: ${{ needs.validate.outputs.channel }}
         working-directory: source/zapps/zergmeeting
         run: |
           set -euo pipefail
@@ -413,8 +479,8 @@ jobs:
           app="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Zerg Meeting.app"
           for executable in \
             "$app/Contents/MacOS/zergmeeting" \
-            "$app/Contents/MacOS/node-aarch64-apple-darwin" \
-            "$app/Contents/MacOS/ztc-capture-aarch64-apple-darwin"; do
+            "$app/Contents/MacOS/node" \
+            "$app/Contents/MacOS/ztc-capture"; do
             test -f "$executable" && test ! -L "$executable" && test -x "$executable"
           done
           resources="$app/Contents/Resources/desktop-runtime"
@@ -422,15 +488,15 @@ jobs:
             "$resources/meeting-bridge.mjs" \
             "$resources/dist/runtime" \
             "$resources/dist/modes" \
-            "$resources/node_modules/.bin/ztc" \
-            "$resources/node_modules/zerg-ztc"; do
+            "$resources/node_modules/zerg-ztc/dist/cli_main.js"; do
             test -e "$path" && test ! -L "$path"
           done
+          test ! -e "$resources/node_modules/.bin"
           if find "$resources" -type l -print -quit | grep -q .; then
             echo "::error::Bundled ZergMeeting runtime contains a symbolic link."
             exit 1
           fi
-          test "$("$app/Contents/MacOS/node-aarch64-apple-darwin" --version)" = "v22.23.2"
+          test "$("$app/Contents/MacOS/node" --version)" = "v22.23.2"
 
       - name: Package a bounded unsigned source stage
         env:
@@ -459,9 +525,9 @@ jobs:
             "${apps[0]}" \
             "$archive"
           if [[ "$ZERGMEETING_UPDATE_CHANNEL" == "stable" ]]; then
-            key_name="updater-stable.pubkey"
+            key_name="updater.stable.pubkey"
           else
-            key_name="updater-preview.pubkey"
+            key_name="updater.preview.pubkey"
           fi
           cp "src-tauri/$key_name" "$source_stage/updater.pubkey"
 
